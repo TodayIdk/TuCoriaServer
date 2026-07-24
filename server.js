@@ -467,21 +467,24 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            if (type === PT.C_BLOCK_SPAWN) {
-                const b = r.readBlock();
-                b.blockId = room.nextBlockId++;
-                b.ownerId = info.playerId;
-                room.blocks.set(b.blockId, b);
+if (type === PT.C_BLOCK_SPAWN) {
+    const b = r.readBlock();
+    b.blockId = room.nextBlockId++;
+    b.ownerId = info.playerId;
+    room.blocks.set(b.blockId, b);
 
-                const body = createRigidBodyForBlock(room, b);
-                if (body) room.rigidBodies.set(b.blockId, body);
+    const body = createRigidBodyForBlock(room, b);
+    if (body) {
+        room.rigidBodies.set(b.blockId, body);
+        if (!b.anchored) body.wakeUp();
+    }
 
-                const w = new Writer();
-                w.u8(PT.S_BLOCK_SPAWN);
-                w.writeBlock(b);
-                broadcast(room, w.build());
-                return;
-            }
+    const w = new Writer();
+    w.u8(PT.S_BLOCK_SPAWN);
+    w.writeBlock(b);
+    broadcast(room, w.build());
+    return;
+}
 if (type === PT.C_BLOCK_UPDATE) {
     const b = r.readBlock();
     if (!room.blocks.has(b.blockId)) return;
