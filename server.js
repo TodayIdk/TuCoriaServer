@@ -12,7 +12,6 @@ const PORT = process.env.PORT || 3000;
 const rooms = new Map();
 let nextRoomIdx = 1;
 const MAX_PLAYERS_PER_ROOM = 20;
-
 function createRoom() {
     const id = 'room_' + (nextRoomIdx++);
     const room = {
@@ -26,8 +25,36 @@ function createRoom() {
         createdAt: Date.now()
     };
     rooms.set(id, room);
+    
+    // Создаём стандартную сцену — Baseplate
+    createDefaultScene(room);
+    
     console.log(`[LOBBY] Created ${id}`);
     return room;
+}
+
+function createDefaultScene(room) {
+    // Baseplate — большая зелёная платформа
+    const baseplate = {
+        blockId: room.nextBlockId++,
+        shape: 0, // Block
+        position: { x: 0, y: -0.5, z: 0 },
+        rotation: { w: 1, x: 0, y: 0, z: 0 },
+        size: { x: 100, y: 1, z: 100 },
+        color: { x: 40/255, y: 90/255, z: 40/255 }, // зелёный
+        anchored: 1,
+        canCollide: 1,
+        roughness: 0.7,
+        metallic: 0.0,
+        transparency: 0.0,
+        castShadow: 1,
+        materialName: "grass",
+        name: "Baseplate",
+        ownerId: 0
+    };
+    room.blocks.set(baseplate.blockId, baseplate);
+
+    console.log(`[SCENE] Created default scene in ${room.id}`);
 }
 
 function findAvailableRoom() {
