@@ -21,8 +21,8 @@ function createRoom() {
     const room = {
         id,
         name: `TuCoria #${nextRoomIdx - 1}`,
-        clients: new Map(),      // ws -> { playerId, name, userId }
-        blocks: new Map(),       // blockId -> NetBlockData
+        clients: new Map(),
+        blocks: new Map(),
         nextPlayerId: 1,
         nextBlockId: 1,
         maxPlayers: MAX_PLAYERS_PER_ROOM,
@@ -156,6 +156,7 @@ class Writer {
 }
 
 function send(ws, buf) {
+    if (ws.isBot) return; // боты игнорируют входящие
     if (ws.readyState === WebSocket.OPEN) ws.send(buf);
 }
 
@@ -165,6 +166,112 @@ function broadcast(room, buf, exclude = null) {
         send(ws, buf);
     }
 }
+
+// ═══════════════════════════════════════
+//  Фейковые боты для тестов
+// ═══════════════════════════════════════
+let nextBotUserId = 1000000;
+const bots = new Map();
+
+function spawnBot(name = 'Bot') {
+    const room = findAvailableRoom();
+    const playerId = room.nextPlayerId++;
+    const userId = nextBotUserId++;
+    const botId = 'bot_' + userId;
+
+    const info = { playerId, name, userId, isBot: true };
+
+    const fakeWs = {
+        readyState: 1,
+        send: () => {},
+        isBot: true,
+        botId
+    };
+
+    room.clients.set(fakeWs, info);
+
+    console.log(`[BOT] Spawned ${name} (pid=${playerId}) in ${room.id}`);
+
+    const jw = new Writer();
+    jw.u8(PT.S_PLAYER_JOIN);
+    jw.u32(playerId);
+    jw.str(name);
+    broadcast(room, jw.build());
+
+    let angle = Math.random() * Math.PI * 2;
+    const centerX = (Math.random() - 0.5) * 40;
+    const centerZ = (Math.random() - 0.5) * 40;
+    const radius = 5 + Math.random() * 5;
+    const anim = 1; // Walk
+
+    const interval = setInterval(() => {
+        if (!rooms.has(room.id)) {
+            clearInterval(interval);
+            return;
+        }
+        angle += 0.03;
+        const x = centerX + Math.cos(angle) * radius;
+        const z = centerZ + Math.sin(angle) * radius;
+        const y = 5;
+        const yaw = (angle * 180 / Math.PI) + 90;
+
+        const w = new Writer();
+        w.u8(PT.S_PLAYER_STATE);
+        w.u32(playerId);
+        w.vec3({ x, y, z });
+        w.f32(yaw);
+        w.u8(anim);
+        w.u8(0);
+        broadcast(room, w.build());
+    }, 50);
+
+    bots.set(botId, { room, playerId, name, fakeWs, interval });
+    return { botId, playerId, name, roomId: room.id };
+}
+
+function removeBot(botId) {
+    const bot = bots.get(botId);
+    if (!bot) return false;
+    clearInterval(bot.interval);
+    bot.room.clients.delete(bot.fakeWs);
+    const w = new Writer();
+    w.u8(PT.S_PLAYER_LEAVE);
+    w.u32(bot.playerId);
+    broadcast(bot.room, w.build());
+    bots.delete(botId);
+    console.log(`[BOT] Removed ${bot.name}`);
+    return true;
+}
+
+// HTTP endpoints для ботов
+app.post('/bots/add', (req, res) => {
+    const name = (req.body && req.body.name) || 'Bot' + Math.floor(Math.random() * 1000);
+    const bot = spawnBot(name);
+    res.json({ ok: true, bot });
+});
+
+app.get('/bots', (req, res) => {
+    const list = Array.from(bots.entries()).map(([id, b]) => ({
+        botId: id,
+        name: b.name,
+        playerId: b.playerId,
+        roomId: b.room.id
+    }));
+    res.json({ bots: list, count: list.length });
+});
+
+app.delete('/bots/:id', (req, res) => {
+    const ok = removeBot(req.params.id);
+    res.json({ ok });
+});
+
+app.delete('/bots', (req, res) => {
+    let count = 0;
+    for (const id of Array.from(bots.keys())) {
+        if (removeBot(id)) count++;
+    }
+    res.json({ ok: true, removed: count });
+});
 
 // ═══════════════════════════════════════
 //  Обработка соединения
@@ -179,7 +286,6 @@ wss.on('connection', (ws, req) => {
             const r = new Reader(data);
             const type = r.u8();
 
-            // HELLO — регистрация
             if (type === PT.C_HELLO) {
                 const name = r.str();
                 let userId = 0;
@@ -188,6 +294,30 @@ wss.on('connection', (ws, req) => {
                 if (userId === 0 || !name) {
                     console.log(`[WS] Rejected: no auth`);
                     ws.close();
+                    return;
+                }
+
+                // Проверка дубликата userId
+                let alreadyConnected = false;
+                for (const rm of rooms.values()) {
+                    for (const [, i] of rm.clients) {
+                        if (i.userId === userId && !i.isBot) {
+                            alreadyConnected = true;
+                            break;
+                        }
+                    }
+                    if (alreadyConnected) break;
+                }
+
+                if (alreadyConnected) {
+                    console.log(`[WS] Rejected: userId ${userId} already connected`);
+                    const w = new Writer();
+                    w.u8(PT.S_CHAT);
+                    w.u32(0);
+                    w.str("System");
+                    w.str("You are already connected from another session");
+                    send(ws, w.build());
+                    setTimeout(() => ws.close(), 500);
                     return;
                 }
 
@@ -234,7 +364,6 @@ wss.on('connection', (ws, req) => {
             const info = ws.info;
             if (!room || !info) return;
 
-            // PLAYER STATE
             if (type === PT.C_PLAYER_STATE) {
                 const pos = r.vec3();
                 const yaw = r.f32();
@@ -252,7 +381,6 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // CHAT
             if (type === PT.C_CHAT) {
                 const text = r.str();
                 if (!text) return;
@@ -266,7 +394,6 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // PING
             if (type === PT.C_PING) {
                 const seq = r.u32();
                 const w = new Writer();
@@ -276,7 +403,6 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // BLOCK SPAWN
             if (type === PT.C_BLOCK_SPAWN) {
                 const b = r.readBlock();
                 b.blockId = room.nextBlockId++;
@@ -290,7 +416,6 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // BLOCK UPDATE
             if (type === PT.C_BLOCK_UPDATE) {
                 const b = r.readBlock();
                 if (room.blocks.has(b.blockId)) {
@@ -303,7 +428,6 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // BLOCK DELETE
             if (type === PT.C_BLOCK_DELETE) {
                 const blockId = r.u32();
                 if (room.blocks.has(blockId)) {
@@ -333,7 +457,15 @@ wss.on('connection', (ws, req) => {
         w.u32(info.playerId);
         broadcast(room, w.build());
 
-        if (room.clients.size === 0 && rooms.size > 1) {
+        // Считаем только реальных клиентов (не боты)
+        let realClients = 0;
+        for (const [wsx] of room.clients) {
+            if (!wsx.isBot) realClients++;
+        }
+        if (realClients === 0 && rooms.size > 1) {
+            for (const [id, b] of Array.from(bots.entries())) {
+                if (b.room === room) removeBot(id);
+            }
             rooms.delete(room.id);
             console.log(`[LOBBY] Removed empty ${room.id}`);
         }
