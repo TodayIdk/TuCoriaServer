@@ -482,47 +482,46 @@ wss.on('connection', (ws, req) => {
                 broadcast(room, w.build());
                 return;
             }
+if (type === PT.C_BLOCK_UPDATE) {
+    const b = r.readBlock();
+    if (!room.blocks.has(b.blockId)) return;
 
-            if (type === PT.C_BLOCK_UPDATE) {
-                const b = r.readBlock();
-                if (!room.blocks.has(b.blockId)) return;
+    const oldBlock = room.blocks.get(b.blockId);
+    room.blocks.set(b.blockId, b);
 
-                const oldBlock = room.blocks.get(b.blockId);
-                room.blocks.set(b.blockId, b);
+    const needRecreate =
+        oldBlock.shape !== b.shape ||
+        oldBlock.anchored !== b.anchored ||
+        oldBlock.canCollide !== b.canCollide ||
+        Math.abs(oldBlock.size.x - b.size.x) > 0.01 ||
+        Math.abs(oldBlock.size.y - b.size.y) > 0.01 ||
+        Math.abs(oldBlock.size.z - b.size.z) > 0.01;
 
-                const needRecreate =
-                    oldBlock.shape !== b.shape ||
-                    oldBlock.anchored !== b.anchored ||
-                    oldBlock.canCollide !== b.canCollide ||
-                    Math.abs(oldBlock.size.x - b.size.x) > 0.01 ||
-                    Math.abs(oldBlock.size.y - b.size.y) > 0.01 ||
-                    Math.abs(oldBlock.size.z - b.size.z) > 0.01;
+    if (needRecreate) {
+        removeRigidBody(room, b.blockId);
+        const body = createRigidBodyForBlock(room, b);
+        if (body) room.rigidBodies.set(b.blockId, body);
+    } else {
+        const body = room.rigidBodies.get(b.blockId);
+        if (body) {
+            body.setTranslation(b.position, true);
+            body.setRotation({
+                x: b.rotation.x, y: b.rotation.y,
+                z: b.rotation.z, w: b.rotation.w
+            }, true);
+            // Обязательно сбрасываем скорость и будим
+            body.setLinvel({x:0, y:0, z:0}, true);
+            body.setAngvel({x:0, y:0, z:0}, true);
+            body.wakeUp();
+        }
+    }
 
-                if (needRecreate) {
-                    removeRigidBody(room, b.blockId);
-                    const body = createRigidBodyForBlock(room, b);
-                    if (body) room.rigidBodies.set(b.blockId, body);
-                } else {
-                    const body = room.rigidBodies.get(b.blockId);
-                    if (body) {
-                        body.setTranslation(b.position, true);
-                        body.setRotation({
-                            x: b.rotation.x, y: b.rotation.y,
-                            z: b.rotation.z, w: b.rotation.w
-                        }, true);
-                        if (!b.anchored) {
-                            body.setLinvel({x:0,y:0,z:0}, true);
-                            body.setAngvel({x:0,y:0,z:0}, true);
-                        }
-                    }
-                }
-
-                const w = new Writer();
-                w.u8(PT.S_BLOCK_UPDATE);
-                w.writeBlock(b);
-                broadcast(room, w.build(), ws);
-                return;
-            }
+    const w = new Writer();
+    w.u8(PT.S_BLOCK_UPDATE);
+    w.writeBlock(b);
+    broadcast(room, w.build(), ws);
+    return;
+}
 
             if (type === PT.C_BLOCK_DELETE) {
                 const blockId = r.u32();
