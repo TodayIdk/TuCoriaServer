@@ -9,9 +9,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ═══════════════════════════════════════
-//  Комнаты (максимум 20 игроков в каждой)
-// ═══════════════════════════════════════
 const rooms = new Map();
 let nextRoomIdx = 1;
 const MAX_PLAYERS_PER_ROOM = 20;
