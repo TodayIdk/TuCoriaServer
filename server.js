@@ -55,9 +55,6 @@ app.get('/servers', (req, res) => {
     res.json({ servers: list, count: list.length });
 });
 
-// ═══════════════════════════════════════
-//  WebSocket
-// ═══════════════════════════════════════
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
