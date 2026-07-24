@@ -57,7 +57,8 @@ function createRigidBodyForBlock(room, block) {
     } else {
         bodyDesc = RAPIER.RigidBodyDesc.dynamic()
             .setLinearDamping(0.3)
-            .setAngularDamping(0.3);
+            .setAngularDamping(0.3)
+            .setCanSleep(false);  // ← НЕ ЗАСЫПАТЬ
     }
 
     bodyDesc.setTranslation(block.position.x, block.position.y, block.position.z);
@@ -136,7 +137,6 @@ function physicsStep() {
         }
     }
 }
-
 function syncPhysicsToClients(room) {
     const updates = [];
     const toDelete = [];
@@ -147,15 +147,12 @@ function syncPhysicsToClients(room) {
 
         const p = body.translation();
 
-        // Удаляем упавшие за карту
         if (p.y < -100) {
             toDelete.push(blockId);
             continue;
         }
 
-        // Пропускаем спящие
-        if (body.isSleeping()) continue;
-
+        // Убрали проверку isSleeping — всегда синкаем
         const r = body.rotation();
         block.position = { x: p.x, y: p.y, z: p.z };
         block.rotation = { w: r.w, x: r.x, y: r.y, z: r.z };
@@ -183,7 +180,6 @@ function syncPhysicsToClients(room) {
     }
     broadcast(room, w.build());
 }
-
 setInterval(physicsStep, 1000 / 30); // 30 Hz
 
 // ═══════════════════════════════════════
