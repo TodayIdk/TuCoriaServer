@@ -180,49 +180,176 @@ function spawnBot(name = 'Bot') {
     const botId = 'bot_' + userId;
 
     const info = { playerId, name, userId, isBot: true };
-
-    const fakeWs = {
-        readyState: 1,
-        send: () => {},
-        isBot: true,
-        botId
-    };
-
+    const fakeWs = { readyState: 1, send: () => {}, isBot: true, botId };
     room.clients.set(fakeWs, info);
 
     console.log(`[BOT] Spawned ${name} (pid=${playerId}) in ${room.id}`);
 
+    // Оповестить о новом игроке
     const jw = new Writer();
     jw.u8(PT.S_PLAYER_JOIN);
     jw.u32(playerId);
     jw.str(name);
     broadcast(room, jw.build());
 
-    let angle = Math.random() * Math.PI * 2;
-    const centerX = (Math.random() - 0.5) * 40;
-    const centerZ = (Math.random() - 0.5) * 40;
-    const radius = 5 + Math.random() * 5;
-    const anim = 1; // Walk
+    // ═══ Состояние бота ═══
+    const state = {
+        pos: { x: (Math.random() - 0.5) * 30, y: 5, z: (Math.random() - 0.5) * 30 },
+        target: { x: 0, y: 5, z: 0 },
+        yaw: 0,
+        speed: 3.0,
+        buildTimer: 3 + Math.random() * 4,   // через сколько сек строить
+        chatTimer: 15 + Math.random() * 30,  // через сколько писать в чат
+        moveTimer: 0,
+        anim: 0,
+        jumpTimer: 0
+    };
 
+    const pickNewTarget = () => {
+        state.target = {
+            x: (Math.random() - 0.5) * 40,
+            y: 3 + Math.random() * 8,
+            z: (Math.random() - 0.5) * 40
+        };
+    };
+    pickNewTarget();
+
+    // Фразы для чата
+    const buildPhrases = [
+        "Строю базу тут",
+        "Смотри что делаю",
+        "Кто хочет помочь?",
+        "Крутая идея пришла",
+        "Тут будет дом",
+        "Добавлю ещё блок",
+        "Как вам постройка?",
+        "Nice building",
+        "Работаю над стеной",
+        "Ставлю крышу",
+        "Тестирую физику",
+        "Красивый цвет получился"
+    ];
+
+    // Материалы для случайного выбора
+    const materials = ["", "brick", "wood", "metal", "concrete", "plastic", "grass"];
+    const shapes = [0, 1, 2, 3, 4]; // Block, Ball, Cylinder, Wedge, Tube
+
+    // Случайный цвет
+    const randColor = () => ({
+        x: Math.random(),
+        y: Math.random(),
+        z: Math.random()
+    });
+
+    // ═══ Основной луп ═══
+    const dt = 0.05; // 50ms = 20 tps
     const interval = setInterval(() => {
         if (!rooms.has(room.id)) {
             clearInterval(interval);
             return;
         }
-        angle += 0.03;
-        const x = centerX + Math.cos(angle) * radius;
-        const z = centerZ + Math.sin(angle) * radius;
-        const y = 5;
-        const yaw = (angle * 180 / Math.PI) + 90;
 
-        const w = new Writer();
-        w.u8(PT.S_PLAYER_STATE);
-        w.u32(playerId);
-        w.vec3({ x, y, z });
-        w.f32(yaw);
-        w.u8(anim);
-        w.u8(0);
-        broadcast(room, w.build());
+        // ── Движение к target ──
+        const dx = state.target.x - state.pos.x;
+        const dy = state.target.y - state.pos.y;
+        const dz = state.target.z - state.pos.z;
+        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+        if (dist < 1.0) {
+            // Достигли — выбираем новую цель
+            state.moveTimer += dt;
+            if (state.moveTimer > 1 + Math.random() * 3) {
+                pickNewTarget();
+                state.moveTimer = 0;
+            }
+            state.anim = 0; // Idle
+        } else {
+            // Двигаемся
+            const step = state.speed * dt;
+            state.pos.x += (dx / dist) * step;
+            state.pos.y += (dy / dist) * step;
+            state.pos.z += (dz / dist) * step;
+            state.yaw = Math.atan2(dz, dx) * 180 / Math.PI;
+            state.anim = 1; // Walk
+        }
+
+        // Прыжок
+        state.jumpTimer -= dt;
+        if (state.jumpTimer <= 0) {
+            state.jumpTimer = 8 + Math.random() * 10;
+            if (Math.random() > 0.5) state.anim = 4; // JumpStart
+        }
+
+        // ── Отправляем позицию ──
+        {
+            const w = new Writer();
+            w.u8(PT.S_PLAYER_STATE);
+            w.u32(playerId);
+            w.vec3(state.pos);
+            w.f32(state.yaw);
+            w.u8(state.anim);
+            w.u8(0);
+            broadcast(room, w.build());
+        }
+
+        // ── Стройка ──
+        state.buildTimer -= dt;
+        if (state.buildTimer <= 0) {
+            state.buildTimer = 4 + Math.random() * 6;
+
+            // Спавним блок рядом с ботом
+            const shape = shapes[Math.floor(Math.random() * shapes.length)];
+            const size = 1 + Math.random() * 3;
+            const material = materials[Math.floor(Math.random() * materials.length)];
+
+            const block = {
+                blockId: room.nextBlockId++,
+                shape: shape,
+                position: {
+                    x: state.pos.x + (Math.random() - 0.5) * 4,
+                    y: state.pos.y - 2 + Math.random() * 2,
+                    z: state.pos.z + (Math.random() - 0.5) * 4
+                },
+                rotation: { w: 1, x: 0, y: 0, z: 0 },
+                size: {
+                    x: size,
+                    y: size * (0.5 + Math.random() * 1.5),
+                    z: size
+                },
+                color: randColor(),
+                anchored: 1,
+                canCollide: 1,
+                roughness: 0.5,
+                metallic: Math.random() > 0.7 ? 0.8 : 0.0,
+                transparency: 0,
+                castShadow: 1,
+                materialName: material,
+                name: name + "_Block",
+                ownerId: playerId
+            };
+            room.blocks.set(block.blockId, block);
+
+            const w = new Writer();
+            w.u8(PT.S_BLOCK_SPAWN);
+            w.writeBlock(block);
+            broadcast(room, w.build());
+
+            console.log(`[BOT] ${name} spawned block #${block.blockId}`);
+        }
+
+        // ── Чат ──
+        state.chatTimer -= dt;
+        if (state.chatTimer <= 0) {
+            state.chatTimer = 20 + Math.random() * 40;
+            const phrase = buildPhrases[Math.floor(Math.random() * buildPhrases.length)];
+
+            const w = new Writer();
+            w.u8(PT.S_CHAT);
+            w.u32(playerId);
+            w.str(name);
+            w.str(phrase);
+            broadcast(room, w.build());
+        }
     }, 50);
 
     bots.set(botId, { room, playerId, name, fakeWs, interval });
