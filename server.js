@@ -489,33 +489,39 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            if (type === PT.C_BLOCK_SPAWN) {
-                if (room.blocks.size >= MAX_BLOCKS_PER_ROOM) {
-                    const w = new Writer();
-                    w.u8(PT.S_CHAT); w.u32(0);
-                    w.str("System");
-                    w.str("Block limit reached (" + MAX_BLOCKS_PER_ROOM + ")");
-                    send(ws, w.build());
-                    return;
-                }
+if (type === PT.C_BLOCK_SPAWN) {
+    if (room.blocks.size >= MAX_BLOCKS_PER_ROOM) {
+        const w = new Writer();
+        w.u8(PT.S_CHAT); w.u32(0);
+        w.str("System");
+        w.str("Block limit reached (" + MAX_BLOCKS_PER_ROOM + ")");
+        send(ws, w.build());
+        return;
+    }
 
-                const b = r.readBlock();
-                b.blockId = room.nextBlockId++;
-                b.ownerId = info.playerId;
-                room.blocks.set(b.blockId, b);
+    const b = r.readBlock();
+    b.blockId = room.nextBlockId++;
+    b.ownerId = info.playerId;
+    room.blocks.set(b.blockId, b);
 
-                const body = createRigidBodyForBlock(room, b);
-                if (body) {
-                    room.rigidBodies.set(b.blockId, body);
-                    if (!b.anchored) body.wakeUp();
-                }
+    const body = createRigidBodyForBlock(room, b);
+    if (body) {
+        room.rigidBodies.set(b.blockId, body);
+        if (!b.anchored) body.wakeUp();
+    }
 
-                const w = new Writer();
-                w.u8(PT.S_BLOCK_SPAWN);
-                w.writeBlock(b);
-                broadcast(room, w.build());
-                return;
-            }
+    // Отправляем ВСЕМ — включая отправителя, чтобы он узнал blockId
+    // Но отправителю шлём отдельно с его blockId для маппинга
+    const w = new Writer();
+    w.u8(PT.S_BLOCK_SPAWN);
+    w.writeBlock(b);
+    broadcast(room, w.build(), ws);  // ← всем КРОМЕ отправителя
+
+    // Отправителю отдельно — он создаст блок локально
+    send(ws, w.build());
+    return;
+}
+            
 
             if (type === PT.C_BLOCK_UPDATE) {
                 const b = r.readBlock();
