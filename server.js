@@ -9,10 +9,13 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const MAX_PLAYERS_PER_ROOM = 20;
+const MAX_BLOCKS_PER_ROOM = 1000;
+const PHYSICS_STEP = 1.0 / 30.0;
+const NET_SYNC_MS = 50;
 
 const rooms = new Map();
 let nextRoomIdx = 1;
-const MAX_PLAYERS_PER_ROOM = 20;
 
 // ═══════════════════════════════════════
 //  Комнаты + физика
@@ -56,9 +59,9 @@ function createRigidBodyForBlock(room, block) {
         bodyDesc = RAPIER.RigidBodyDesc.fixed();
     } else {
         bodyDesc = RAPIER.RigidBodyDesc.dynamic()
-            .setLinearDamping(0.3)
-            .setAngularDamping(0.3)
-            .setCanSleep(false);  // ← НЕ ЗАСЫПАТЬ
+            .setLinearDamping(0.5)
+            .setAngularDamping(0.5)
+            .setCanSleep(true);
     }
 
     bodyDesc.setTranslation(block.position.x, block.position.y, block.position.z);
@@ -117,16 +120,19 @@ function createDefaultScene(room) {
 }
 
 // ═══════════════════════════════════════
-//  Физический tick — 30 Hz (не 60)
+//  Физика
 // ═══════════════════════════════════════
-const PHYSICS_STEP = 1.0 / 30.0;
-const NET_SYNC_MS = 50; // 20 Hz sync
-
 function physicsStep() {
     const now = Date.now();
     for (const room of rooms.values()) {
         if (!room.world || !room.physicsActive) continue;
-        if (room.clients.size === 0) continue; // не считаем пустые
+        if (room.clients.size === 0) continue;
+
+        let hasDynamic = false;
+        for (const [, block] of room.blocks) {
+            if (!block.anchored) { hasDynamic = true; break; }
+        }
+        if (!hasDynamic) continue;
 
         room.world.timestep = PHYSICS_STEP;
         room.world.step();
@@ -137,6 +143,7 @@ function physicsStep() {
         }
     }
 }
+
 function syncPhysicsToClients(room) {
     const updates = [];
     const toDelete = [];
@@ -152,7 +159,8 @@ function syncPhysicsToClients(room) {
             continue;
         }
 
-        // Убрали проверку isSleeping — всегда синкаем
+        if (body.isSleeping()) continue;
+
         const r = body.rotation();
         block.position = { x: p.x, y: p.y, z: p.z };
         block.rotation = { w: r.w, x: r.x, y: r.y, z: r.z };
@@ -180,12 +188,13 @@ function syncPhysicsToClients(room) {
     }
     broadcast(room, w.build());
 }
-setInterval(physicsStep, 1000 / 30); // 30 Hz
+
+setInterval(physicsStep, 1000 / 30);
 
 // ═══════════════════════════════════════
 //  HTTP
 // ═══════════════════════════════════════
-app.get('/', (req, res) => res.send('TuCoria Server (rapier3d)'));
+app.get('/', (req, res) => res.send('TuCoria Server'));
 
 app.get('/servers', (req, res) => {
     const list = Array.from(rooms.values()).map(r => ({
@@ -195,6 +204,23 @@ app.get('/servers', (req, res) => {
         uptime: Math.floor((Date.now() - r.createdAt) / 1000)
     }));
     res.json({ servers: list, count: list.length });
+});
+
+app.get('/status', (req, res) => {
+    const mem = process.memoryUsage();
+    let totalBlocks = 0, totalBodies = 0, totalClients = 0;
+    for (const room of rooms.values()) {
+        totalBlocks += room.blocks.size;
+        totalBodies += room.rigidBodies.size;
+        totalClients += room.clients.size;
+    }
+    res.json({
+        uptime: Math.floor(process.uptime()),
+        memoryMB: Math.round(mem.rss / 1024 / 1024),
+        heapMB: Math.round(mem.heapUsed / 1024 / 1024),
+        rooms: rooms.size,
+        totalBlocks, totalBodies, totalClients
+    });
 });
 
 app.post('/crash', (req, res) => {
@@ -369,8 +395,11 @@ app.delete('/bots', (req, res) => {
 //  WebSocket
 // ═══════════════════════════════════════
 wss.on('connection', (ws, req) => {
+    ws.isAlive = true;
     ws.room = null;
     ws.info = null;
+
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
         try {
@@ -406,7 +435,6 @@ wss.on('connection', (ws, req) => {
                 ws.room = room;
                 ws.info = info;
 
-                // WELCOME
                 const w = new Writer();
                 w.u8(PT.S_WELCOME);
                 w.u32(playerId);
@@ -416,14 +444,12 @@ wss.on('connection', (ws, req) => {
                 for (const o of others) { w.u32(o.playerId); w.str(o.name); }
                 send(ws, w.build());
 
-                // BLOCK LIST
                 const bw = new Writer();
                 bw.u8(PT.S_BLOCK_LIST);
                 bw.u32(room.blocks.size);
                 for (const b of room.blocks.values()) bw.writeBlock(b);
                 send(ws, bw.build());
 
-                // Notify others
                 const jw = new Writer();
                 jw.u8(PT.S_PLAYER_JOIN);
                 jw.u32(playerId); jw.str(name);
@@ -463,64 +489,76 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-if (type === PT.C_BLOCK_SPAWN) {
-    const b = r.readBlock();
-    b.blockId = room.nextBlockId++;
-    b.ownerId = info.playerId;
-    room.blocks.set(b.blockId, b);
+            if (type === PT.C_BLOCK_SPAWN) {
+                if (room.blocks.size >= MAX_BLOCKS_PER_ROOM) {
+                    const w = new Writer();
+                    w.u8(PT.S_CHAT); w.u32(0);
+                    w.str("System");
+                    w.str("Block limit reached (" + MAX_BLOCKS_PER_ROOM + ")");
+                    send(ws, w.build());
+                    return;
+                }
 
-    const body = createRigidBodyForBlock(room, b);
-    if (body) {
-        room.rigidBodies.set(b.blockId, body);
-        if (!b.anchored) body.wakeUp();
-    }
+                const b = r.readBlock();
+                b.blockId = room.nextBlockId++;
+                b.ownerId = info.playerId;
+                room.blocks.set(b.blockId, b);
 
-    const w = new Writer();
-    w.u8(PT.S_BLOCK_SPAWN);
-    w.writeBlock(b);
-    broadcast(room, w.build());
-    return;
-}
-if (type === PT.C_BLOCK_UPDATE) {
-    const b = r.readBlock();
-    if (!room.blocks.has(b.blockId)) return;
+                const body = createRigidBodyForBlock(room, b);
+                if (body) {
+                    room.rigidBodies.set(b.blockId, body);
+                    if (!b.anchored) body.wakeUp();
+                }
 
-    const oldBlock = room.blocks.get(b.blockId);
-    room.blocks.set(b.blockId, b);
+                const w = new Writer();
+                w.u8(PT.S_BLOCK_SPAWN);
+                w.writeBlock(b);
+                broadcast(room, w.build());
+                return;
+            }
 
-    const needRecreate =
-        oldBlock.shape !== b.shape ||
-        oldBlock.anchored !== b.anchored ||
-        oldBlock.canCollide !== b.canCollide ||
-        Math.abs(oldBlock.size.x - b.size.x) > 0.01 ||
-        Math.abs(oldBlock.size.y - b.size.y) > 0.01 ||
-        Math.abs(oldBlock.size.z - b.size.z) > 0.01;
+            if (type === PT.C_BLOCK_UPDATE) {
+                const b = r.readBlock();
+                if (!room.blocks.has(b.blockId)) return;
 
-    if (needRecreate) {
-        removeRigidBody(room, b.blockId);
-        const body = createRigidBodyForBlock(room, b);
-        if (body) room.rigidBodies.set(b.blockId, body);
-    } else {
-        const body = room.rigidBodies.get(b.blockId);
-        if (body) {
-            body.setTranslation(b.position, true);
-            body.setRotation({
-                x: b.rotation.x, y: b.rotation.y,
-                z: b.rotation.z, w: b.rotation.w
-            }, true);
-            // Обязательно сбрасываем скорость и будим
-            body.setLinvel({x:0, y:0, z:0}, true);
-            body.setAngvel({x:0, y:0, z:0}, true);
-            body.wakeUp();
-        }
-    }
+                const oldBlock = room.blocks.get(b.blockId);
+                room.blocks.set(b.blockId, b);
 
-    const w = new Writer();
-    w.u8(PT.S_BLOCK_UPDATE);
-    w.writeBlock(b);
-    broadcast(room, w.build(), ws);
-    return;
-}
+                const needRecreate =
+                    oldBlock.shape !== b.shape ||
+                    oldBlock.anchored !== b.anchored ||
+                    oldBlock.canCollide !== b.canCollide ||
+                    Math.abs(oldBlock.size.x - b.size.x) > 0.01 ||
+                    Math.abs(oldBlock.size.y - b.size.y) > 0.01 ||
+                    Math.abs(oldBlock.size.z - b.size.z) > 0.01;
+
+                if (needRecreate) {
+                    removeRigidBody(room, b.blockId);
+                    const body = createRigidBodyForBlock(room, b);
+                    if (body) {
+                        room.rigidBodies.set(b.blockId, body);
+                        if (!b.anchored) body.wakeUp();
+                    }
+                } else {
+                    const body = room.rigidBodies.get(b.blockId);
+                    if (body) {
+                        body.setTranslation(b.position, true);
+                        body.setRotation({
+                            x: b.rotation.x, y: b.rotation.y,
+                            z: b.rotation.z, w: b.rotation.w
+                        }, true);
+                        body.setLinvel({x:0, y:0, z:0}, true);
+                        body.setAngvel({x:0, y:0, z:0}, true);
+                        body.wakeUp();
+                    }
+                }
+
+                const w = new Writer();
+                w.u8(PT.S_BLOCK_UPDATE);
+                w.writeBlock(b);
+                broadcast(room, w.build(), ws);
+                return;
+            }
 
             if (type === PT.C_BLOCK_DELETE) {
                 const blockId = r.u32();
@@ -542,6 +580,9 @@ if (type === PT.C_BLOCK_UPDATE) {
     ws.on('close', () => {
         const room = ws.room;
         const info = ws.info;
+        ws.room = null;
+        ws.info = null;
+
         if (!room || !info) return;
         room.clients.delete(ws);
 
@@ -555,8 +596,7 @@ if (type === PT.C_BLOCK_UPDATE) {
         if (realClients === 0 && rooms.size > 1) {
             for (const body of room.rigidBodies.values()) room.world.removeRigidBody(body);
             room.rigidBodies.clear();
-            room.world.free();
-            room.world = null;
+            if (room.world) { room.world.free(); room.world = null; }
             for (const [id, b] of Array.from(bots.entries())) {
                 if (b.room === room) removeBot(id);
             }
@@ -568,12 +608,23 @@ if (type === PT.C_BLOCK_UPDATE) {
     ws.on('error', () => {});
 });
 
+// Пинг мёртвых клиентов
+setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+            ws.terminate();
+            return;
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 15000);
+
 // ═══════════════════════════════════════
 //  Запуск
 // ═══════════════════════════════════════
 (async () => {
     await RAPIER.init();
-    console.log('[RAPIER] Physics initialized');
     server.listen(PORT, () => {
         console.log(`[SERVER] Listening on port ${PORT}`);
     });
