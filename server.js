@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const https = require('https');
 const WebSocket = require('ws');
 const RAPIER = require('@dimforge/rapier3d-compat');
 
@@ -14,8 +15,22 @@ const MAX_BLOCKS_PER_ROOM = 1000;
 const PHYSICS_STEP = 1.0 / 30.0;
 const NET_SYNC_MS = 50;
 
+// URL сервера для self-ping (замените на свой)
+const SELF_URL = process.env.SELF_URL || 'https://tucoriaserver.onrender.com';
+
 const rooms = new Map();
 let nextRoomIdx = 1;
+
+// ═══════════════════════════════════════
+//  KEEP-ALIVE — сервер не засыпает
+// ═══════════════════════════════════════
+setInterval(() => {
+    https.get(SELF_URL + '/status', (res) => {
+        // Просто чтобы Render видел активность
+    }).on('error', () => {
+        // Молча игнорируем
+    });
+}, 10 * 60 * 1000); // каждые 10 минут
 
 // ═══════════════════════════════════════
 //  Комнаты + физика
@@ -97,7 +112,7 @@ function createRigidBodyForBlock(room, block) {
 function removeRigidBody(room, blockId) {
     const body = room.rigidBodies.get(blockId);
     if (body) {
-        room.world.removeRigidBody(body);
+        try { room.world.removeRigidBody(body); } catch (e) {}
         room.rigidBodies.delete(blockId);
     }
 }
@@ -120,7 +135,7 @@ function createDefaultScene(room) {
 }
 
 // ═══════════════════════════════════════
-//  Физика
+//  Физика с защитой от крашей
 // ═══════════════════════════════════════
 function physicsStep() {
     const now = Date.now();
@@ -134,12 +149,19 @@ function physicsStep() {
         }
         if (!hasDynamic) continue;
 
-        room.world.timestep = PHYSICS_STEP;
-        room.world.step();
+        try {
+            room.world.timestep = PHYSICS_STEP;
+            room.world.step();
+        } catch (e) {
+            console.error(`[PHYSICS] Step error in ${room.id}:`, e.message);
+            continue;
+        }
 
         if (now - room.lastPhysicsSync >= NET_SYNC_MS) {
             room.lastPhysicsSync = now;
-            syncPhysicsToClients(room);
+            try { syncPhysicsToClients(room); } catch (e) {
+                console.error(`[PHYSICS] Sync error:`, e.message);
+            }
         }
     }
 }
@@ -194,7 +216,14 @@ setInterval(physicsStep, 1000 / 30);
 // ═══════════════════════════════════════
 //  HTTP
 // ═══════════════════════════════════════
-app.get('/', (req, res) => res.send('TuCoria Server'));
+app.get('/', (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send('TuCoria Server OK');
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', uptime: Math.floor(process.uptime()) });
+});
 
 app.get('/servers', (req, res) => {
     const list = Array.from(rooms.values()).map(r => ({
@@ -219,7 +248,8 @@ app.get('/status', (req, res) => {
         memoryMB: Math.round(mem.rss / 1024 / 1024),
         heapMB: Math.round(mem.heapUsed / 1024 / 1024),
         rooms: rooms.size,
-        totalBlocks, totalBodies, totalClients
+        totalBlocks, totalBodies, totalClients,
+        bots: bots.size
     });
 });
 
@@ -234,7 +264,9 @@ app.post('/kickall', (req, res) => {
     bots.clear();
     for (const room of rooms.values()) {
         for (const [ws] of room.clients) {
-            if (!ws.isBot && ws.readyState === WebSocket.OPEN) { ws.close(); count++; }
+            if (!ws.isBot && ws.readyState === WebSocket.OPEN) {
+                try { ws.close(); count++; } catch(e){}
+            }
         }
         room.clients.clear();
     }
@@ -242,10 +274,16 @@ app.post('/kickall', (req, res) => {
 });
 
 // ═══════════════════════════════════════
-//  Пакеты
+//  WebSocket
 // ═══════════════════════════════════════
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/ws' });
+const wss = new WebSocket.Server({
+    server,
+    path: '/ws',
+    perMessageDeflate: false,
+    maxPayload: 512 * 1024, // 512 KB
+    clientTracking: true
+});
 
 const PT = {
     S_WELCOME: 1, S_PLAYER_JOIN: 2, S_PLAYER_LEAVE: 3, S_PLAYER_STATE: 4,
@@ -313,7 +351,8 @@ class Writer {
 
 function send(ws, buf) {
     if (ws.isBot) return;
-    if (ws.readyState === WebSocket.OPEN) ws.send(buf);
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(buf); } catch (e) {}
 }
 
 function broadcast(room, buf, exclude = null) {
@@ -392,16 +431,18 @@ app.delete('/bots', (req, res) => {
 });
 
 // ═══════════════════════════════════════
-//  WebSocket
+//  WebSocket handlers
 // ═══════════════════════════════════════
 wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.room = null;
     ws.info = null;
+    ws.lastMessageTime = Date.now();
 
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
+        ws.lastMessageTime = Date.now();
         try {
             const r = new Reader(data);
             const type = r.u8();
@@ -424,7 +465,7 @@ wss.on('connection', (ws, req) => {
                     w.u8(PT.S_CHAT); w.u32(0);
                     w.str("System"); w.str("You are already connected from another session");
                     send(ws, w.build());
-                    setTimeout(() => ws.close(), 500);
+                    setTimeout(() => { try { ws.close(); } catch(e){} }, 500);
                     return;
                 }
 
@@ -489,39 +530,34 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-if (type === PT.C_BLOCK_SPAWN) {
-    if (room.blocks.size >= MAX_BLOCKS_PER_ROOM) {
-        const w = new Writer();
-        w.u8(PT.S_CHAT); w.u32(0);
-        w.str("System");
-        w.str("Block limit reached (" + MAX_BLOCKS_PER_ROOM + ")");
-        send(ws, w.build());
-        return;
-    }
+            if (type === PT.C_BLOCK_SPAWN) {
+                if (room.blocks.size >= MAX_BLOCKS_PER_ROOM) {
+                    const w = new Writer();
+                    w.u8(PT.S_CHAT); w.u32(0);
+                    w.str("System");
+                    w.str("Block limit reached (" + MAX_BLOCKS_PER_ROOM + ")");
+                    send(ws, w.build());
+                    return;
+                }
 
-    const b = r.readBlock();
-    b.blockId = room.nextBlockId++;
-    b.ownerId = info.playerId;
-    room.blocks.set(b.blockId, b);
+                const b = r.readBlock();
+                b.blockId = room.nextBlockId++;
+                b.ownerId = info.playerId;
+                room.blocks.set(b.blockId, b);
 
-    const body = createRigidBodyForBlock(room, b);
-    if (body) {
-        room.rigidBodies.set(b.blockId, body);
-        if (!b.anchored) body.wakeUp();
-    }
+                const body = createRigidBodyForBlock(room, b);
+                if (body) {
+                    room.rigidBodies.set(b.blockId, body);
+                    if (!b.anchored) body.wakeUp();
+                }
 
-    // Отправляем ВСЕМ — включая отправителя, чтобы он узнал blockId
-    // Но отправителю шлём отдельно с его blockId для маппинга
-    const w = new Writer();
-    w.u8(PT.S_BLOCK_SPAWN);
-    w.writeBlock(b);
-    broadcast(room, w.build(), ws);  // ← всем КРОМЕ отправителя
-
-    // Отправителю отдельно — он создаст блок локально
-    send(ws, w.build());
-    return;
-}
-            
+                const w = new Writer();
+                w.u8(PT.S_BLOCK_SPAWN);
+                w.writeBlock(b);
+                broadcast(room, w.build(), ws);
+                send(ws, w.build());
+                return;
+            }
 
             if (type === PT.C_BLOCK_UPDATE) {
                 const b = r.readBlock();
@@ -579,7 +615,7 @@ if (type === PT.C_BLOCK_SPAWN) {
             }
 
         } catch (e) {
-            console.error('[WS] Error:', e.message);
+            console.error('[WS] Msg error:', e.message);
         }
     });
 
@@ -600,9 +636,15 @@ if (type === PT.C_BLOCK_SPAWN) {
         let realClients = 0;
         for (const [wsx] of room.clients) if (!wsx.isBot) realClients++;
         if (realClients === 0 && rooms.size > 1) {
-            for (const body of room.rigidBodies.values()) room.world.removeRigidBody(body);
-            room.rigidBodies.clear();
-            if (room.world) { room.world.free(); room.world = null; }
+            try {
+                for (const body of room.rigidBodies.values()) {
+                    try { room.world.removeRigidBody(body); } catch(e) {}
+                }
+                room.rigidBodies.clear();
+                if (room.world) { room.world.free(); room.world = null; }
+            } catch (e) {
+                console.error('[LOBBY] Cleanup error:', e.message);
+            }
             for (const [id, b] of Array.from(bots.entries())) {
                 if (b.room === room) removeBot(id);
             }
@@ -611,27 +653,64 @@ if (type === PT.C_BLOCK_SPAWN) {
         }
     });
 
-    ws.on('error', () => {});
+    ws.on('error', (e) => {
+        // Тихо игнорируем — обычно это разрыв соединения
+    });
 });
 
-// Пинг мёртвых клиентов
+// ═══════════════════════════════════════
+//  Heartbeat — убиваем мёртвых клиентов
+// ═══════════════════════════════════════
 setInterval(() => {
+    const now = Date.now();
     wss.clients.forEach((ws) => {
+        // Убиваем клиентов без сообщений >2 минут
+        if (ws.lastMessageTime && now - ws.lastMessageTime > 120000) {
+            try { ws.terminate(); } catch(e){}
+            return;
+        }
         if (ws.isAlive === false) {
-            ws.terminate();
+            try { ws.terminate(); } catch(e){}
             return;
         }
         ws.isAlive = false;
-        ws.ping();
+        try { ws.ping(); } catch(e){}
     });
 }, 15000);
+
+// ═══════════════════════════════════════
+//  Обработка крашей — не даём процессу упасть
+// ═══════════════════════════════════════
+process.on('uncaughtException', (err) => {
+    console.error('[FATAL] Uncaught:', err.message);
+    console.error(err.stack);
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[FATAL] Rejection:', reason);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('[SERVER] SIGTERM received, closing...');
+    wss.clients.forEach((ws) => {
+        try { ws.close(); } catch(e){}
+    });
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000);
+});
 
 // ═══════════════════════════════════════
 //  Запуск
 // ═══════════════════════════════════════
 (async () => {
-    await RAPIER.init();
-    server.listen(PORT, () => {
-        console.log(`[SERVER] Listening on port ${PORT}`);
-    });
+    try {
+        await RAPIER.init();
+        server.listen(PORT, () => {
+            console.log(`[SERVER] Listening on port ${PORT}`);
+        });
+    } catch (e) {
+        console.error('[SERVER] Startup failed:', e);
+        process.exit(1);
+    }
 })();
