@@ -9,31 +9,47 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+// ═══════════════════════════════════════
+//  Настройки
+// ═══════════════════════════════════════
+const PORT                 = process.env.PORT || 3000;
 const MAX_PLAYERS_PER_ROOM = 20;
-const MAX_BLOCKS_PER_ROOM = 1000;
-const PHYSICS_STEP = 1.0 / 30.0;
-const NET_SYNC_MS = 50;
+const MAX_BLOCKS_PER_ROOM  = 1000;
+const PHYSICS_STEP         = 1.0 / 30.0;
+const NET_SYNC_MS          = 50;
+const SELF_URL             = process.env.SELF_URL || 'https://tucoriaserver.onrender.com';
 
-// URL сервера для self-ping (замените на свой)
-const SELF_URL = process.env.SELF_URL || 'https://tucoriaserver.onrender.com';
+// Rate limiting
+const MAX_MSGS_PER_SEC     = 60;
+const MAX_BLOCK_SPAWNS_SEC = 8;
+const MAX_CHAT_PER_10_SEC  = 5;
+
+// Настройки игрока
+const PLAYER_MAX_HEALTH    = 100;
+const RESPAWN_DELAY_MS     = 2500;
 
 const rooms = new Map();
 let nextRoomIdx = 1;
 
 // ═══════════════════════════════════════
-//  KEEP-ALIVE — сервер не засыпает
+//  Logger
 // ═══════════════════════════════════════
-setInterval(() => {
-    https.get(SELF_URL + '/status', (res) => {
-        // Просто чтобы Render видел активность
-    }).on('error', () => {
-        // Молча игнорируем
-    });
-}, 10 * 60 * 1000); // каждые 10 минут
+const log = {
+    info: (...args)  => console.log('[INFO]', new Date().toISOString(), ...args),
+    warn: (...args)  => console.warn('[WARN]', new Date().toISOString(), ...args),
+    error: (...args) => console.error('[ERR ]', new Date().toISOString(), ...args),
+    debug: (...args) => { if (process.env.DEBUG) console.log('[DBG ]', ...args); }
+};
 
 // ═══════════════════════════════════════
-//  Комнаты + физика
+//  Keep-alive
+// ═══════════════════════════════════════
+setInterval(() => {
+    https.get(SELF_URL + '/status').on('error', () => {});
+}, 10 * 60 * 1000);
+
+// ═══════════════════════════════════════
+//  Комнаты
 // ═══════════════════════════════════════
 function createRoom() {
     const id = 'room_' + (nextRoomIdx++);
@@ -55,7 +71,7 @@ function createRoom() {
     };
     rooms.set(id, room);
     createDefaultScene(room);
-    console.log(`[LOBBY] Created ${id}`);
+    log.info(`Created room ${id}`);
     return room;
 }
 
@@ -69,15 +85,12 @@ function findAvailableRoom() {
 function createRigidBodyForBlock(room, block) {
     if (!room.world) return null;
 
-    let bodyDesc;
-    if (block.anchored) {
-        bodyDesc = RAPIER.RigidBodyDesc.fixed();
-    } else {
-        bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+    let bodyDesc = block.anchored
+        ? RAPIER.RigidBodyDesc.fixed()
+        : RAPIER.RigidBodyDesc.dynamic()
             .setLinearDamping(0.5)
             .setAngularDamping(0.5)
             .setCanSleep(true);
-    }
 
     bodyDesc.setTranslation(block.position.x, block.position.y, block.position.z);
     bodyDesc.setRotation({
@@ -127,7 +140,7 @@ function createDefaultScene(room) {
         color: { x: 40/255, y: 90/255, z: 40/255 },
         anchored: 1, canCollide: 1,
         roughness: 0.7, metallic: 0.0, transparency: 0.0,
-        castShadow: 1, materialName: "grass",
+        castShadow: 1, materialName: "Grass",
         name: "Baseplate", ownerId: 0
     };
     room.blocks.set(baseplate.blockId, baseplate);
@@ -135,7 +148,59 @@ function createDefaultScene(room) {
 }
 
 // ═══════════════════════════════════════
-//  Физика с защитой от крашей
+//  Валидация данных от клиента
+// ═══════════════════════════════════════
+function isValidVec3(v) {
+    return v && typeof v.x === 'number' && typeof v.y === 'number' && typeof v.z === 'number'
+        && isFinite(v.x) && isFinite(v.y) && isFinite(v.z);
+}
+
+function isValidQuat(q) {
+    return q && typeof q.w === 'number' && typeof q.x === 'number'
+        && typeof q.y === 'number' && typeof q.z === 'number'
+        && isFinite(q.w) && isFinite(q.x) && isFinite(q.y) && isFinite(q.z);
+}
+
+function clamp(v, mn, mx) { return Math.max(mn, Math.min(mx, v)); }
+
+function validateBlock(b) {
+    if (!isValidVec3(b.position) || !isValidQuat(b.rotation)
+        || !isValidVec3(b.size) || !isValidVec3(b.color)) return false;
+
+    // Ограничения позиции
+    if (Math.abs(b.position.x) > 5000 || Math.abs(b.position.y) > 5000 || Math.abs(b.position.z) > 5000)
+        return false;
+
+    // Размер
+    b.size.x = clamp(b.size.x, 0.1, 200);
+    b.size.y = clamp(b.size.y, 0.1, 200);
+    b.size.z = clamp(b.size.z, 0.1, 200);
+
+    // Цвет
+    b.color.x = clamp(b.color.x, 0, 1);
+    b.color.y = clamp(b.color.y, 0, 1);
+    b.color.z = clamp(b.color.z, 0, 1);
+
+    // Параметры
+    b.roughness    = clamp(b.roughness,    0, 1);
+    b.metallic     = clamp(b.metallic,     0, 1);
+    b.transparency = clamp(b.transparency, 0, 1);
+    b.shape        = clamp(b.shape,        0, 4);
+    b.anchored     = b.anchored ? 1 : 0;
+    b.canCollide   = b.canCollide ? 1 : 0;
+    b.castShadow   = b.castShadow ? 1 : 0;
+
+    // Строки
+    if (typeof b.name !== 'string') b.name = 'Part';
+    if (b.name.length > 64) b.name = b.name.substring(0, 64);
+    if (typeof b.materialName !== 'string') b.materialName = '';
+    if (b.materialName.length > 32) b.materialName = b.materialName.substring(0, 32);
+
+    return true;
+}
+
+// ═══════════════════════════════════════
+//  Физика
 // ═══════════════════════════════════════
 function physicsStep() {
     const now = Date.now();
@@ -153,15 +218,14 @@ function physicsStep() {
             room.world.timestep = PHYSICS_STEP;
             room.world.step();
         } catch (e) {
-            console.error(`[PHYSICS] Step error in ${room.id}:`, e.message);
+            log.error(`Physics step error in ${room.id}:`, e.message);
             continue;
         }
 
         if (now - room.lastPhysicsSync >= NET_SYNC_MS) {
             room.lastPhysicsSync = now;
-            try { syncPhysicsToClients(room); } catch (e) {
-                console.error(`[PHYSICS] Sync error:`, e.message);
-            }
+            try { syncPhysicsToClients(room); }
+            catch (e) { log.error(`Physics sync error:`, e.message); }
         }
     }
 }
@@ -214,11 +278,11 @@ function syncPhysicsToClients(room) {
 setInterval(physicsStep, 1000 / 30);
 
 // ═══════════════════════════════════════
-//  HTTP
+//  HTTP endpoints
 // ═══════════════════════════════════════
 app.get('/', (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
-    res.send('TuCoria Server OK');
+    res.send('TuCoria Server v0.8 OK');
 });
 
 app.get('/health', (req, res) => {
@@ -244,6 +308,7 @@ app.get('/status', (req, res) => {
         totalClients += room.clients.size;
     }
     res.json({
+        version: '0.8',
         uptime: Math.floor(process.uptime()),
         memoryMB: Math.round(mem.rss / 1024 / 1024),
         heapMB: Math.round(mem.heapUsed / 1024 / 1024),
@@ -281,17 +346,42 @@ const wss = new WebSocket.Server({
     server,
     path: '/ws',
     perMessageDeflate: false,
-    maxPayload: 512 * 1024, // 512 KB
+    maxPayload: 512 * 1024,
     clientTracking: true
 });
 
 const PT = {
-    S_WELCOME: 1, S_PLAYER_JOIN: 2, S_PLAYER_LEAVE: 3, S_PLAYER_STATE: 4,
-    S_CHAT: 5, S_PING: 6, S_PONG: 7,
-    S_BLOCK_SPAWN: 20, S_BLOCK_UPDATE: 21, S_BLOCK_DELETE: 22, S_BLOCK_LIST: 23,
+    // Server -> Client
+    S_WELCOME:        1,
+    S_PLAYER_JOIN:    2,
+    S_PLAYER_LEAVE:   3,
+    S_PLAYER_STATE:   4,
+    S_CHAT:           5,
+    S_PING:           6,
+    S_PONG:           7,
+    S_PLAYER_HEALTH:  8,   // ← НОВОЕ
+    S_PLAYER_DEATH:   9,   // ← НОВОЕ
+    S_PLAYER_RESPAWN: 10,  // ← НОВОЕ
+
+    S_BLOCK_SPAWN:   20,
+    S_BLOCK_UPDATE:  21,
+    S_BLOCK_DELETE:  22,
+    S_BLOCK_LIST:    23,
     S_PHYSICS_STATE: 24,
-    C_HELLO: 100, C_PLAYER_STATE: 101, C_CHAT: 102, C_PING: 103, C_PONG: 104,
-    C_BLOCK_SPAWN: 120, C_BLOCK_UPDATE: 121, C_BLOCK_DELETE: 122
+
+    // Client -> Server
+    C_HELLO:         100,
+    C_PLAYER_STATE:  101,
+    C_CHAT:          102,
+    C_PING:          103,
+    C_PONG:          104,
+    C_PLAYER_HEALTH: 105,  // ← НОВОЕ
+    C_PLAYER_DEATH:  106,  // ← НОВОЕ
+    C_REQUEST_RESPAWN: 107, // ← НОВОЕ
+
+    C_BLOCK_SPAWN:   120,
+    C_BLOCK_UPDATE:  121,
+    C_BLOCK_DELETE:  122
 };
 
 class Reader {
@@ -374,7 +464,11 @@ function spawnBot(name = 'Bot') {
     const userId = nextBotUserId++;
     const botId = 'bot_' + userId;
 
-    const info = { playerId, name, userId, isBot: true };
+    const info = {
+        playerId, name, userId, isBot: true,
+        health: PLAYER_MAX_HEALTH, isDead: false,
+        rateLimits: null
+    };
     const fakeWs = { readyState: 1, send: () => {}, isBot: true, botId };
     room.clients.set(fakeWs, info);
 
@@ -431,39 +525,125 @@ app.delete('/bots', (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  Rate limiting
+// ═══════════════════════════════════════
+function createRateLimits() {
+    return {
+        msgCount: 0,
+        msgResetAt: Date.now() + 1000,
+        blockSpawnCount: 0,
+        blockSpawnResetAt: Date.now() + 1000,
+        chatCount: 0,
+        chatResetAt: Date.now() + 10000
+    };
+}
+
+function checkRate(rl, type) {
+    const now = Date.now();
+
+    if (type === 'msg') {
+        if (now > rl.msgResetAt) { rl.msgCount = 0; rl.msgResetAt = now + 1000; }
+        rl.msgCount++;
+        return rl.msgCount <= MAX_MSGS_PER_SEC;
+    }
+    if (type === 'block') {
+        if (now > rl.blockSpawnResetAt) { rl.blockSpawnCount = 0; rl.blockSpawnResetAt = now + 1000; }
+        rl.blockSpawnCount++;
+        return rl.blockSpawnCount <= MAX_BLOCK_SPAWNS_SEC;
+    }
+    if (type === 'chat') {
+        if (now > rl.chatResetAt) { rl.chatCount = 0; rl.chatResetAt = now + 10000; }
+        rl.chatCount++;
+        return rl.chatCount <= MAX_CHAT_PER_10_SEC;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════
+//  Health System — helpers
+// ═══════════════════════════════════════
+function broadcastPlayerHealth(room, info) {
+    const w = new Writer();
+    w.u8(PT.S_PLAYER_HEALTH);
+    w.u32(info.playerId);
+    w.f32(info.health);
+    broadcast(room, w.build());
+}
+
+function broadcastPlayerDeath(room, info) {
+    const w = new Writer();
+    w.u8(PT.S_PLAYER_DEATH);
+    w.u32(info.playerId);
+    broadcast(room, w.build());
+}
+
+function broadcastPlayerRespawn(room, info) {
+    const w = new Writer();
+    w.u8(PT.S_PLAYER_RESPAWN);
+    w.u32(info.playerId);
+    w.f32(info.health);
+    broadcast(room, w.build());
+}
+
+// ═══════════════════════════════════════
 //  WebSocket handlers
 // ═══════════════════════════════════════
 wss.on('connection', (ws, req) => {
+    // Читаем реальный IP из Cloudflare header если есть
+    const realIP = req.headers['cf-connecting-ip']
+                || req.headers['x-forwarded-for']
+                || req.socket.remoteAddress;
+
     ws.isAlive = true;
     ws.room = null;
     ws.info = null;
     ws.lastMessageTime = Date.now();
+    ws.realIP = realIP;
+    ws.rateLimits = createRateLimits();
+
+    log.debug(`Connection from ${realIP}`);
 
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
         ws.lastMessageTime = Date.now();
+
+        // Rate limit
+        if (!checkRate(ws.rateLimits, 'msg')) {
+            log.warn(`Rate limit exceeded for ${ws.realIP}`);
+            try { ws.close(1008, 'Rate limit exceeded'); } catch(e){}
+            return;
+        }
+
         try {
             const r = new Reader(data);
             const type = r.u8();
 
+            // ─── HELLO ───
             if (type === PT.C_HELLO) {
                 const name = r.str();
                 let userId = 0;
                 try { userId = r.u32(); } catch(e){}
-                if (userId === 0 || !name) { ws.close(); return; }
+                if (userId === 0 || !name || name.length > 32) {
+                    log.warn(`Invalid hello from ${ws.realIP}`);
+                    ws.close(); return;
+                }
 
+                // Проверка на дубликаты
                 let alreadyConnected = false;
                 for (const rm of rooms.values()) {
                     for (const [, i] of rm.clients) {
-                        if (i.userId === userId && !i.isBot) { alreadyConnected = true; break; }
+                        if (i.userId === userId && !i.isBot) {
+                            alreadyConnected = true; break;
+                        }
                     }
                     if (alreadyConnected) break;
                 }
                 if (alreadyConnected) {
                     const w = new Writer();
                     w.u8(PT.S_CHAT); w.u32(0);
-                    w.str("System"); w.str("You are already connected from another session");
+                    w.str("System");
+                    w.str("You are already connected from another session");
                     send(ws, w.build());
                     setTimeout(() => { try { ws.close(); } catch(e){} }, 500);
                     return;
@@ -471,30 +651,51 @@ wss.on('connection', (ws, req) => {
 
                 const room = findAvailableRoom();
                 const playerId = room.nextPlayerId++;
-                const info = { playerId, name, userId };
+                const info = {
+                    playerId, name, userId,
+                    health: PLAYER_MAX_HEALTH,
+                    isDead: false,
+                    lastPosition: { x: 0, y: 5, z: 0 },
+                    joinedAt: Date.now()
+                };
                 room.clients.set(ws, info);
                 ws.room = room;
                 ws.info = info;
 
+                // Welcome
                 const w = new Writer();
                 w.u8(PT.S_WELCOME);
                 w.u32(playerId);
                 const others = Array.from(room.clients.entries())
-                    .filter(([wsx]) => wsx !== ws).map(([, i]) => i);
+                    .filter(([wsx]) => wsx !== ws)
+                    .map(([, i]) => i);
                 w.u32(others.length);
                 for (const o of others) { w.u32(o.playerId); w.str(o.name); }
                 send(ws, w.build());
 
+                // Block list
                 const bw = new Writer();
                 bw.u8(PT.S_BLOCK_LIST);
                 bw.u32(room.blocks.size);
                 for (const b of room.blocks.values()) bw.writeBlock(b);
                 send(ws, bw.build());
 
+                // Health других игроков
+                for (const o of others) {
+                    const hw = new Writer();
+                    hw.u8(PT.S_PLAYER_HEALTH);
+                    hw.u32(o.playerId);
+                    hw.f32(o.health);
+                    send(ws, hw.build());
+                }
+
+                // Оповещаем других
                 const jw = new Writer();
                 jw.u8(PT.S_PLAYER_JOIN);
                 jw.u32(playerId); jw.str(name);
                 broadcast(room, jw.build(), ws);
+
+                log.info(`Player joined: ${name} (id=${playerId}, room=${room.id}, ip=${realIP})`);
                 return;
             }
 
@@ -502,9 +703,18 @@ wss.on('connection', (ws, req) => {
             const info = ws.info;
             if (!room || !info) return;
 
+            // ─── PLAYER STATE ───
             if (type === PT.C_PLAYER_STATE) {
-                const pos = r.vec3(); const yaw = r.f32();
-                const anim = r.u8(); const crouch = r.u8();
+                const pos = r.vec3();
+                const yaw = r.f32();
+                const anim = r.u8();
+                const crouch = r.u8();
+
+                if (!isValidVec3(pos) || !isFinite(yaw)) return;
+                if (Math.abs(pos.x) > 5000 || Math.abs(pos.y) > 5000 || Math.abs(pos.z) > 5000) return;
+
+                info.lastPosition = pos;
+
                 const w = new Writer();
                 w.u8(PT.S_PLAYER_STATE); w.u32(info.playerId);
                 w.vec3(pos); w.f32(yaw); w.u8(anim); w.u8(crouch);
@@ -512,9 +722,20 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
+            // ─── CHAT ───
             if (type === PT.C_CHAT) {
-                const text = r.str();
+                if (!checkRate(ws.rateLimits, 'chat')) {
+                    const w = new Writer();
+                    w.u8(PT.S_CHAT); w.u32(0);
+                    w.str("System");
+                    w.str("Slow down! You're chatting too fast.");
+                    send(ws, w.build());
+                    return;
+                }
+                let text = r.str();
                 if (!text) return;
+                if (text.length > 200) text = text.substring(0, 200);
+
                 const w = new Writer();
                 w.u8(PT.S_CHAT); w.u32(info.playerId);
                 w.str(info.name); w.str(text);
@@ -522,6 +743,7 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
+            // ─── PING ───
             if (type === PT.C_PING) {
                 const seq = r.u32();
                 const w = new Writer();
@@ -530,7 +752,55 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
+            // ─── PLAYER HEALTH ───
+            if (type === PT.C_PLAYER_HEALTH) {
+                let hp = r.f32();
+                if (!isFinite(hp)) return;
+                hp = clamp(hp, 0, PLAYER_MAX_HEALTH);
+
+                if (info.isDead) return;
+                info.health = hp;
+                broadcastPlayerHealth(room, info);
+                return;
+            }
+
+            // ─── PLAYER DEATH ───
+            if (type === PT.C_PLAYER_DEATH) {
+                if (info.isDead) return;
+                info.isDead = true;
+                info.health = 0;
+                broadcastPlayerDeath(room, info);
+
+                // Автоматический респавн через delay
+                setTimeout(() => {
+                    if (!ws.info || !ws.room) return;
+                    info.isDead = false;
+                    info.health = PLAYER_MAX_HEALTH;
+                    broadcastPlayerRespawn(room, info);
+                }, RESPAWN_DELAY_MS);
+                return;
+            }
+
+            // ─── REQUEST RESPAWN ───
+            if (type === PT.C_REQUEST_RESPAWN) {
+                if (!info.isDead) return;
+                info.isDead = false;
+                info.health = PLAYER_MAX_HEALTH;
+                broadcastPlayerRespawn(room, info);
+                return;
+            }
+
+            // ─── BLOCK SPAWN ───
             if (type === PT.C_BLOCK_SPAWN) {
+                if (!checkRate(ws.rateLimits, 'block')) {
+                    const w = new Writer();
+                    w.u8(PT.S_CHAT); w.u32(0);
+                    w.str("System");
+                    w.str("Slow down! Spawning too fast.");
+                    send(ws, w.build());
+                    return;
+                }
+
                 if (room.blocks.size >= MAX_BLOCKS_PER_ROOM) {
                     const w = new Writer();
                     w.u8(PT.S_CHAT); w.u32(0);
@@ -541,6 +811,8 @@ wss.on('connection', (ws, req) => {
                 }
 
                 const b = r.readBlock();
+                if (!validateBlock(b)) return;
+
                 b.blockId = room.nextBlockId++;
                 b.ownerId = info.playerId;
                 room.blocks.set(b.blockId, b);
@@ -559,8 +831,10 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
+            // ─── BLOCK UPDATE ───
             if (type === PT.C_BLOCK_UPDATE) {
                 const b = r.readBlock();
+                if (!validateBlock(b)) return;
                 if (!room.blocks.has(b.blockId)) return;
 
                 const oldBlock = room.blocks.get(b.blockId);
@@ -602,6 +876,7 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
+            // ─── BLOCK DELETE ───
             if (type === PT.C_BLOCK_DELETE) {
                 const blockId = r.u32();
                 if (!room.blocks.has(blockId)) return;
@@ -615,7 +890,7 @@ wss.on('connection', (ws, req) => {
             }
 
         } catch (e) {
-            console.error('[WS] Msg error:', e.message);
+            log.error('WS msg error:', e.message);
         }
     });
 
@@ -633,6 +908,9 @@ wss.on('connection', (ws, req) => {
         w.u32(info.playerId);
         broadcast(room, w.build());
 
+        log.info(`Player left: ${info.name} (id=${info.playerId})`);
+
+        // Cleanup пустых комнат
         let realClients = 0;
         for (const [wsx] of room.clients) if (!wsx.isBot) realClients++;
         if (realClients === 0 && rooms.size > 1) {
@@ -643,28 +921,27 @@ wss.on('connection', (ws, req) => {
                 room.rigidBodies.clear();
                 if (room.world) { room.world.free(); room.world = null; }
             } catch (e) {
-                console.error('[LOBBY] Cleanup error:', e.message);
+                log.error('Cleanup error:', e.message);
             }
             for (const [id, b] of Array.from(bots.entries())) {
                 if (b.room === room) removeBot(id);
             }
             rooms.delete(room.id);
-            console.log(`[LOBBY] Removed ${room.id}`);
+            log.info(`Removed empty room ${room.id}`);
         }
     });
 
     ws.on('error', (e) => {
-        // Тихо игнорируем — обычно это разрыв соединения
+        log.debug(`WS error from ${ws.realIP}: ${e.message}`);
     });
 });
 
 // ═══════════════════════════════════════
-//  Heartbeat — убиваем мёртвых клиентов
+//  Heartbeat
 // ═══════════════════════════════════════
 setInterval(() => {
     const now = Date.now();
     wss.clients.forEach((ws) => {
-        // Убиваем клиентов без сообщений >2 минут
         if (ws.lastMessageTime && now - ws.lastMessageTime > 120000) {
             try { ws.terminate(); } catch(e){}
             return;
@@ -679,20 +956,19 @@ setInterval(() => {
 }, 15000);
 
 // ═══════════════════════════════════════
-//  Обработка крашей — не даём процессу упасть
+//  Crash handlers
 // ═══════════════════════════════════════
 process.on('uncaughtException', (err) => {
-    console.error('[FATAL] Uncaught:', err.message);
-    console.error(err.stack);
+    log.error('FATAL Uncaught:', err.message);
+    log.error(err.stack);
 });
 
 process.on('unhandledRejection', (reason) => {
-    console.error('[FATAL] Rejection:', reason);
+    log.error('FATAL Rejection:', reason);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('[SERVER] SIGTERM received, closing...');
+    log.info('SIGTERM received, closing...');
     wss.clients.forEach((ws) => {
         try { ws.close(); } catch(e){}
     });
@@ -707,10 +983,10 @@ process.on('SIGTERM', () => {
     try {
         await RAPIER.init();
         server.listen(PORT, () => {
-            console.log(`[SERVER] Listening on port ${PORT}`);
+            log.info(`TuCoria Server v0.8 listening on port ${PORT}`);
         });
     } catch (e) {
-        console.error('[SERVER] Startup failed:', e);
+        log.error('Startup failed:', e);
         process.exit(1);
     }
 })();
