@@ -148,7 +148,7 @@ function createDefaultScene(room) {
 }
 
 // ═══════════════════════════════════════
-//  Валидация данных от клиента
+//  Валидация
 // ═══════════════════════════════════════
 function isValidVec3(v) {
     return v && typeof v.x === 'number' && typeof v.y === 'number' && typeof v.z === 'number'
@@ -167,21 +167,17 @@ function validateBlock(b) {
     if (!isValidVec3(b.position) || !isValidQuat(b.rotation)
         || !isValidVec3(b.size) || !isValidVec3(b.color)) return false;
 
-    // Ограничения позиции
     if (Math.abs(b.position.x) > 5000 || Math.abs(b.position.y) > 5000 || Math.abs(b.position.z) > 5000)
         return false;
 
-    // Размер
     b.size.x = clamp(b.size.x, 0.1, 200);
     b.size.y = clamp(b.size.y, 0.1, 200);
     b.size.z = clamp(b.size.z, 0.1, 200);
 
-    // Цвет
     b.color.x = clamp(b.color.x, 0, 1);
     b.color.y = clamp(b.color.y, 0, 1);
     b.color.z = clamp(b.color.z, 0, 1);
 
-    // Параметры
     b.roughness    = clamp(b.roughness,    0, 1);
     b.metallic     = clamp(b.metallic,     0, 1);
     b.transparency = clamp(b.transparency, 0, 1);
@@ -190,7 +186,6 @@ function validateBlock(b) {
     b.canCollide   = b.canCollide ? 1 : 0;
     b.castShadow   = b.castShadow ? 1 : 0;
 
-    // Строки
     if (typeof b.name !== 'string') b.name = 'Part';
     if (b.name.length > 64) b.name = b.name.substring(0, 64);
     if (typeof b.materialName !== 'string') b.materialName = '';
@@ -359,9 +354,10 @@ const PT = {
     S_CHAT:           5,
     S_PING:           6,
     S_PONG:           7,
-    S_PLAYER_HEALTH:  8,   // ← НОВОЕ
-    S_PLAYER_DEATH:   9,   // ← НОВОЕ
-    S_PLAYER_RESPAWN: 10,  // ← НОВОЕ
+    S_PLAYER_HEALTH:  8,
+    S_PLAYER_DEATH:   9,
+    S_PLAYER_RESPAWN: 10,
+    S_PLAYER_TOOL:    11,   // ← НОВОЕ
 
     S_BLOCK_SPAWN:   20,
     S_BLOCK_UPDATE:  21,
@@ -370,14 +366,15 @@ const PT = {
     S_PHYSICS_STATE: 24,
 
     // Client -> Server
-    C_HELLO:         100,
-    C_PLAYER_STATE:  101,
-    C_CHAT:          102,
-    C_PING:          103,
-    C_PONG:          104,
-    C_PLAYER_HEALTH: 105,  // ← НОВОЕ
-    C_PLAYER_DEATH:  106,  // ← НОВОЕ
-    C_REQUEST_RESPAWN: 107, // ← НОВОЕ
+    C_HELLO:            100,
+    C_PLAYER_STATE:     101,
+    C_CHAT:             102,
+    C_PING:             103,
+    C_PONG:             104,
+    C_PLAYER_HEALTH:    105,
+    C_PLAYER_DEATH:     106,
+    C_REQUEST_RESPAWN:  107,
+    C_PLAYER_TOOL:      108,   // ← НОВОЕ
 
     C_BLOCK_SPAWN:   120,
     C_BLOCK_UPDATE:  121,
@@ -467,6 +464,7 @@ function spawnBot(name = 'Bot') {
     const info = {
         playerId, name, userId, isBot: true,
         health: PLAYER_MAX_HEALTH, isDead: false,
+        holdingTool: false,
         rateLimits: null
     };
     const fakeWs = { readyState: 1, send: () => {}, isBot: true, botId };
@@ -560,7 +558,7 @@ function checkRate(rl, type) {
 }
 
 // ═══════════════════════════════════════
-//  Health System — helpers
+//  Health System helpers
 // ═══════════════════════════════════════
 function broadcastPlayerHealth(room, info) {
     const w = new Writer();
@@ -589,7 +587,6 @@ function broadcastPlayerRespawn(room, info) {
 //  WebSocket handlers
 // ═══════════════════════════════════════
 wss.on('connection', (ws, req) => {
-    // Читаем реальный IP из Cloudflare header если есть
     const realIP = req.headers['cf-connecting-ip']
                 || req.headers['x-forwarded-for']
                 || req.socket.remoteAddress;
@@ -608,7 +605,6 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (data) => {
         ws.lastMessageTime = Date.now();
 
-        // Rate limit
         if (!checkRate(ws.rateLimits, 'msg')) {
             log.warn(`Rate limit exceeded for ${ws.realIP}`);
             try { ws.close(1008, 'Rate limit exceeded'); } catch(e){}
@@ -629,7 +625,7 @@ wss.on('connection', (ws, req) => {
                     ws.close(); return;
                 }
 
-                // Проверка на дубликаты
+                // Проверка дубликатов
                 let alreadyConnected = false;
                 for (const rm of rooms.values()) {
                     for (const [, i] of rm.clients) {
@@ -655,6 +651,7 @@ wss.on('connection', (ws, req) => {
                     playerId, name, userId,
                     health: PLAYER_MAX_HEALTH,
                     isDead: false,
+                    holdingTool: false,   // ← НОВОЕ
                     lastPosition: { x: 0, y: 5, z: 0 },
                     joinedAt: Date.now()
                 };
@@ -687,6 +684,17 @@ wss.on('connection', (ws, req) => {
                     hw.u32(o.playerId);
                     hw.f32(o.health);
                     send(ws, hw.build());
+                }
+
+                // ═══ Tool state других игроков — НОВОЕ ═══
+                for (const o of others) {
+                    if (o.holdingTool) {
+                        const tw = new Writer();
+                        tw.u8(PT.S_PLAYER_TOOL);
+                        tw.u32(o.playerId);
+                        tw.u8(1);
+                        send(ws, tw.build());
+                    }
                 }
 
                 // Оповещаем других
@@ -771,7 +779,6 @@ wss.on('connection', (ws, req) => {
                 info.health = 0;
                 broadcastPlayerDeath(room, info);
 
-                // Автоматический респавн через delay
                 setTimeout(() => {
                     if (!ws.info || !ws.room) return;
                     info.isDead = false;
@@ -787,6 +794,19 @@ wss.on('connection', (ws, req) => {
                 info.isDead = false;
                 info.health = PLAYER_MAX_HEALTH;
                 broadcastPlayerRespawn(room, info);
+                return;
+            }
+
+            // ─── PLAYER TOOL — НОВОЕ ═══
+            if (type === PT.C_PLAYER_TOOL) {
+                const holding = r.u8() !== 0;
+                info.holdingTool = holding;
+
+                const w = new Writer();
+                w.u8(PT.S_PLAYER_TOOL);
+                w.u32(info.playerId);
+                w.u8(holding ? 1 : 0);
+                broadcast(room, w.build(), ws);
                 return;
             }
 
