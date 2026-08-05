@@ -20,7 +20,7 @@ const NET_SYNC_MS          = 50;
 const SELF_URL             = process.env.SELF_URL || 'https://tucoriaserver.onrender.com';
 
 // Rate limiting
-const MAX_MSGS_PER_SEC     = 60;
+const MAX_MSGS_PER_SEC     = 120;
 const MAX_BLOCK_SPAWNS_SEC = 8;
 const MAX_CHAT_PER_10_SEC  = 5;
 
@@ -605,11 +605,10 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (data) => {
         ws.lastMessageTime = Date.now();
 
-        if (!checkRate(ws.rateLimits, 'msg')) {
-            log.warn(`Rate limit exceeded for ${ws.realIP}`);
-            try { ws.close(1008, 'Rate limit exceeded'); } catch(e){}
-            return;
-        }
+if (!checkRate(ws.rateLimits, 'msg')) {
+    // Тихо игнорируем сверх-лимитные сообщения (не закрываем соединение)
+    return;
+}
 
         try {
             const r = new Reader(data);
