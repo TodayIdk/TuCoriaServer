@@ -88,7 +88,7 @@ function createPistonData(room, position, sticky, isDefault = false) {
         pistonId: room.nextPistonId++, position, sticky: sticky ? 1 : 0,
         extendDistance: 2.0, extendSpeed: 3.0, currentOffset: 0.0, extended: false,
         frameHalf: { x: 0.6, y: 0.3, z: 0.6 },
-        headHalf:  { x: 0.55, y: 0.12, z: 0.55 },
+        headHalf: { x: 0.55, y: 0.08, z: 0.55 },
         color: { x: sticky ? 0.6 : 1.0, y: 1.0, z: sticky ? 0.6 : 1.0 },
         scale: 0.08, rotation: { x: 0, y: 0, z: 0 },
         isDefault: isDefault ? 1 : 0, ownerId: 0,
