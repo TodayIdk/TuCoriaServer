@@ -83,13 +83,13 @@ function updatePistonHead(room, piston, dt) {
     }
 }
 
-function createPistonData(room, position, sticky, isDefault = false) {
+function createPistonData(room, position, isDefault = false) {
     return {
-        pistonId: room.nextPistonId++, position, sticky: sticky ? 1 : 0,
+        pistonId: room.nextPistonId++, position,
         extendDistance: 2.0, extendSpeed: 3.0, currentOffset: 0.0, extended: false,
         frameHalf: { x: 0.6, y: 0.3, z: 0.6 },
-        headHalf: { x: 0.55, y: 0.08, z: 0.55 },
-        color: { x: sticky ? 0.6 : 1.0, y: 1.0, z: sticky ? 0.6 : 1.0 },
+        headHalf:  { x: 0.55, y: 0.08, z: 0.55 },
+        color: { x: 1.0, y: 1.0, z: 1.0 },
         scale: 0.08, rotation: { x: 0, y: 0, z: 0 },
         isDefault: isDefault ? 1 : 0, ownerId: 0,
         frameBody: null, headBody: null, headBaseY: 0, dirty: true
@@ -128,7 +128,6 @@ function toggleLever(room, lever) {
     }
 }
 
-// ═══ Room ═══
 function createRoom() {
     const id = 'room_' + (nextRoomIdx++);
     const world = new RAPIER.World({ x: 0, y: -30, z: 0 });
@@ -190,10 +189,10 @@ function createDefaultScene(room) {
     room.blocks.set(bp.blockId, bp);
     room.rigidBodies.set(bp.blockId, createRigidBodyForBlock(room, bp));
 
-    const dpList = [ {pos:{x:3,y:0,z:5},sticky:0}, {pos:{x:-3,y:0,z:5},sticky:1} ];
+    const dpList = [ {x:3,y:0,z:5}, {x:-3,y:0,z:5} ];
     const pids = [];
-    for (const d of dpList) {
-        const p = createPistonData(room, d.pos, d.sticky, true);
+    for (const pos of dpList) {
+        const p = createPistonData(room, pos, true);
         room.pistons.set(p.pistonId, p);
         createPistonBodies(room, p);
         pids.push(p.pistonId);
@@ -204,7 +203,6 @@ function createDefaultScene(room) {
     room.levers.set(lever.leverId, lever);
 }
 
-// ═══ Validation ═══
 function isValidVec3(v) { return v && typeof v.x==='number' && typeof v.y==='number' && typeof v.z==='number' && isFinite(v.x) && isFinite(v.y) && isFinite(v.z); }
 function isValidQuat(q) { return q && typeof q.w==='number' && typeof q.x==='number' && typeof q.y==='number' && typeof q.z==='number' && isFinite(q.w) && isFinite(q.x) && isFinite(q.y) && isFinite(q.z); }
 function clamp(v,mn,mx) { return Math.max(mn,Math.min(mx,v)); }
@@ -220,7 +218,6 @@ function validateBlock(b) {
     return true;
 }
 
-// ═══ Physics loop ═══
 function physicsStep() {
     const now = Date.now();
     for (const room of rooms.values()) {
@@ -267,7 +264,6 @@ function syncPistonsToClients(room) {
 
 setInterval(physicsStep, 1000/30);
 
-// ═══ HTTP ═══
 app.get('/', (req,res) => { res.setHeader('Cache-Control','no-cache'); res.send('TuCoria Server v0.8 OK'); });
 app.get('/health', (req,res) => res.json({status:'ok',uptime:Math.floor(process.uptime())}));
 app.get('/servers', (req,res) => {
@@ -288,7 +284,6 @@ app.post('/kickall', (req,res) => {
     res.json({ok:true,disconnected:count});
 });
 
-// ═══ WebSocket ═══
 const server = http.createServer(app);
 const wss = new WebSocket.Server({server,path:'/ws',perMessageDeflate:false,maxPayload:512*1024,clientTracking:true});
 
@@ -327,7 +322,7 @@ class Writer {
     quat(v){this.f32(v.w);this.f32(v.x);this.f32(v.y);this.f32(v.z);}
     str(s){const buf=Buffer.from(s||'','utf8');this.u16(buf.length);if(buf.length>0)this.chunks.push(buf);}
     writeBlock(b){this.u32(b.blockId);this.u8(b.shape);this.vec3(b.position);this.quat(b.rotation);this.vec3(b.size);this.vec3(b.color);this.u8(b.anchored);this.u8(b.canCollide);this.f32(b.roughness);this.f32(b.metallic);this.f32(b.transparency);this.u8(b.castShadow);this.str(b.materialName);this.str(b.name);this.u32(b.ownerId);}
-    writePiston(p){this.u32(p.pistonId);this.vec3(p.position);this.vec3(p.rotation);this.u8(p.sticky);this.f32(p.extendDistance);this.f32(p.extendSpeed);this.f32(p.scale);this.vec3(p.color);this.f32(p.currentOffset);this.u8(p.extended?1:0);this.u8(p.isDefault);this.u32(p.ownerId);}
+    writePiston(p){this.u32(p.pistonId);this.vec3(p.position);this.vec3(p.rotation);this.f32(p.extendDistance);this.f32(p.extendSpeed);this.f32(p.scale);this.vec3(p.color);this.f32(p.currentOffset);this.u8(p.extended?1:0);this.u8(p.isDefault);this.u32(p.ownerId);}
     writeLever(l){this.u32(l.leverId);this.vec3(l.position);this.vec3(l.rotation);this.f32(l.scale);this.u8(l.active?1:0);this.u32(l.linkedPistons.length);for(const pid of l.linkedPistons)this.u32(pid);this.u8(l.isDefault);this.u32(l.ownerId);}
     build(){return Buffer.concat(this.chunks);}
 }
@@ -335,7 +330,6 @@ class Writer {
 function send(ws,buf){if(ws.isBot)return;if(ws.readyState!==WebSocket.OPEN)return;try{ws.send(buf);}catch(e){}}
 function broadcast(room,buf,exclude=null){for(const[ws]of room.clients){if(ws===exclude)continue;send(ws,buf);}}
 
-// ═══ Bots ═══
 let nextBotUserId=1000000;
 const bots=new Map();
 function spawnBot(name='Bot'){
@@ -354,14 +348,12 @@ app.get('/bots',(req,res)=>{const list=Array.from(bots.entries()).map(([id,b])=>
 app.delete('/bots/:id',(req,res)=>res.json({ok:removeBot(req.params.id)}));
 app.delete('/bots',(req,res)=>{let count=0;for(const id of Array.from(bots.keys()))if(removeBot(id))count++;res.json({ok:true,removed:count});});
 
-// ═══ Rate limits ═══
 function createRateLimits(){return{msgCount:0,msgResetAt:Date.now()+1000,blockSpawnCount:0,blockSpawnResetAt:Date.now()+1000,chatCount:0,chatResetAt:Date.now()+10000};}
 function checkRate(rl,type){const now=Date.now();if(type==='msg'){if(now>rl.msgResetAt){rl.msgCount=0;rl.msgResetAt=now+1000;}rl.msgCount++;return rl.msgCount<=MAX_MSGS_PER_SEC;}if(type==='block'){if(now>rl.blockSpawnResetAt){rl.blockSpawnCount=0;rl.blockSpawnResetAt=now+1000;}rl.blockSpawnCount++;return rl.blockSpawnCount<=MAX_BLOCK_SPAWNS_SEC;}if(type==='chat'){if(now>rl.chatResetAt){rl.chatCount=0;rl.chatResetAt=now+10000;}rl.chatCount++;return rl.chatCount<=MAX_CHAT_PER_10_SEC;}return true;}
 function broadcastPlayerHealth(room,info){const w=new Writer();w.u8(PT.S_PLAYER_HEALTH);w.u32(info.playerId);w.f32(info.health);broadcast(room,w.build());}
 function broadcastPlayerDeath(room,info){const w=new Writer();w.u8(PT.S_PLAYER_DEATH);w.u32(info.playerId);broadcast(room,w.build());}
 function broadcastPlayerRespawn(room,info){const w=new Writer();w.u8(PT.S_PLAYER_RESPAWN);w.u32(info.playerId);w.f32(info.health);broadcast(room,w.build());}
 
-// ═══ WS handlers ═══
 wss.on('connection',(ws,req)=>{
     const realIP=req.headers['cf-connecting-ip']||req.headers['x-forwarded-for']||req.socket.remoteAddress;
     ws.isAlive=true;ws.room=null;ws.info=null;ws.lastMessageTime=Date.now();ws.realIP=realIP;ws.rateLimits=createRateLimits();
@@ -412,7 +404,7 @@ wss.on('connection',(ws,req)=>{
             if(type===PT.C_BLOCK_UPDATE){const b=r.readBlock();if(!validateBlock(b))return;if(!room.blocks.has(b.blockId))return;const old=room.blocks.get(b.blockId);room.blocks.set(b.blockId,b);const nr=old.shape!==b.shape||old.anchored!==b.anchored||old.canCollide!==b.canCollide||Math.abs(old.size.x-b.size.x)>0.01||Math.abs(old.size.y-b.size.y)>0.01||Math.abs(old.size.z-b.size.z)>0.01;if(nr){removeRigidBody(room,b.blockId);const body=createRigidBodyForBlock(room,b);if(body){room.rigidBodies.set(b.blockId,body);if(!b.anchored)body.wakeUp();}}else{const body=room.rigidBodies.get(b.blockId);if(body){body.setTranslation(b.position,true);body.setRotation({x:b.rotation.x,y:b.rotation.y,z:b.rotation.z,w:b.rotation.w},true);body.setLinvel({x:0,y:0,z:0},true);body.setAngvel({x:0,y:0,z:0},true);body.wakeUp();}}const w=new Writer();w.u8(PT.S_BLOCK_UPDATE);w.writeBlock(b);broadcast(room,w.build(),ws);return;}
             if(type===PT.C_BLOCK_DELETE){const blockId=r.u32();if(!room.blocks.has(blockId))return;room.blocks.delete(blockId);removeRigidBody(room,blockId);const w=new Writer();w.u8(PT.S_BLOCK_DELETE);w.u32(blockId);broadcast(room,w.build());return;}
 
-            if(type===PT.C_PISTON_SPAWN){if(room.pistons.size>=MAX_PISTONS_PER_ROOM)return;const pos=r.vec3();const sticky=r.u8();if(!isValidVec3(pos))return;const p=createPistonData(room,pos,sticky,false);p.ownerId=info.playerId;room.pistons.set(p.pistonId,p);createPistonBodies(room,p);const w=new Writer();w.u8(PT.S_PISTON_SPAWN);w.writePiston(p);broadcast(room,w.build());return;}
+            if(type===PT.C_PISTON_SPAWN){if(room.pistons.size>=MAX_PISTONS_PER_ROOM)return;const pos=r.vec3();if(!isValidVec3(pos))return;const p=createPistonData(room,pos,false);p.ownerId=info.playerId;room.pistons.set(p.pistonId,p);createPistonBodies(room,p);const w=new Writer();w.u8(PT.S_PISTON_SPAWN);w.writePiston(p);broadcast(room,w.build());return;}
             if(type===PT.C_PISTON_DELETE){const pid=r.u32();const p=room.pistons.get(pid);if(!p||p.isDefault)return;removePistonBodies(room,p);room.pistons.delete(pid);const w=new Writer();w.u8(PT.S_PISTON_DELETE);w.u32(pid);broadcast(room,w.build());return;}
             if(type===PT.C_PISTON_TOGGLE){const pid=r.u32();const p=room.pistons.get(pid);if(!p)return;p.extended=!p.extended;p.dirty=true;const w=new Writer();w.u8(PT.S_PISTON_STATE);w.u32(1);w.u32(p.pistonId);w.f32(p.currentOffset);w.u8(p.extended?1:0);broadcast(room,w.build());return;}
 
