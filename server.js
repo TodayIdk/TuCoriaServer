@@ -14,6 +14,7 @@ const MAX_PLAYERS_PER_ROOM = 20;
 const MAX_BLOCKS_PER_ROOM  = 1000;
 const MAX_PISTONS_PER_ROOM = 100;
 const MAX_LEVERS_PER_ROOM  = 100;
+const MAX_SEATS_PER_ROOM   = 100;
 const PHYSICS_STEP         = 1.0 / 30.0;
 const NET_SYNC_MS          = 50;
 const PISTON_SYNC_MS       = 50;
@@ -128,14 +129,41 @@ function toggleLever(room, lever) {
     }
 }
 
+// ═══ Seat helpers ═══
+function createSeatData(room, position, isDriver, isDefault = false) {
+    return {
+        seatId: room.nextSeatId++, position,
+        rotation: { x: 0, y: 0, z: 0 },
+        isDriver: isDriver ? 1 : 0,
+        occupantId: 0,
+        isDefault: isDefault ? 1 : 0, ownerId: 0,
+        // Driver input state (только для DriverSeat)
+        throttle: 0.0, steer: 0.0
+    };
+}
+
+// Освободить сиденье если игрок вышел
+function releaseSeatByPlayer(room, playerId) {
+    for (const s of room.seats.values()) {
+        if (s.occupantId === playerId) {
+            s.occupantId = 0;
+            s.throttle = 0; s.steer = 0;
+            const w = new Writer();
+            w.u8(PT.S_SEAT_STATE);
+            w.u32(s.seatId); w.u32(0);
+            broadcast(room, w.build());
+        }
+    }
+}
+
 function createRoom() {
     const id = 'room_' + (nextRoomIdx++);
     const world = new RAPIER.World({ x: 0, y: -30, z: 0 });
     const room = {
         id, name: `TuCoria #${nextRoomIdx - 1}`,
         clients: new Map(), blocks: new Map(), rigidBodies: new Map(),
-        pistons: new Map(), levers: new Map(),
-        nextPlayerId: 1, nextBlockId: 1, nextPistonId: 1, nextLeverId: 1,
+        pistons: new Map(), levers: new Map(), seats: new Map(),
+        nextPlayerId: 1, nextBlockId: 1, nextPistonId: 1, nextLeverId: 1, nextSeatId: 1,
         maxPlayers: MAX_PLAYERS_PER_ROOM, createdAt: Date.now(),
         world, lastPhysicsSync: 0, lastPistonSync: 0, lastStepTime: Date.now(),
         physicsActive: true
@@ -267,14 +295,14 @@ setInterval(physicsStep, 1000/30);
 app.get('/', (req,res) => { res.setHeader('Cache-Control','no-cache'); res.send('TuCoria Server v0.8 OK'); });
 app.get('/health', (req,res) => res.json({status:'ok',uptime:Math.floor(process.uptime())}));
 app.get('/servers', (req,res) => {
-    const list=Array.from(rooms.values()).map(r=>({id:r.id,name:r.name,players:r.clients.size,maxPlayers:r.maxPlayers,blocks:r.blocks.size,pistons:r.pistons.size,levers:r.levers.size,uptime:Math.floor((Date.now()-r.createdAt)/1000)}));
+    const list=Array.from(rooms.values()).map(r=>({id:r.id,name:r.name,players:r.clients.size,maxPlayers:r.maxPlayers,blocks:r.blocks.size,pistons:r.pistons.size,levers:r.levers.size,seats:r.seats.size,uptime:Math.floor((Date.now()-r.createdAt)/1000)}));
     res.json({servers:list,count:list.length});
 });
 app.get('/status', (req,res) => {
     const mem=process.memoryUsage();
-    let tb=0,tbd=0,tc=0,tp=0,tl=0;
-    for (const r of rooms.values()) { tb+=r.blocks.size; tbd+=r.rigidBodies.size; tc+=r.clients.size; tp+=r.pistons.size; tl+=r.levers.size; }
-    res.json({version:'0.8',uptime:Math.floor(process.uptime()),memoryMB:Math.round(mem.rss/1024/1024),heapMB:Math.round(mem.heapUsed/1024/1024),rooms:rooms.size,totalBlocks:tb,totalBodies:tbd,totalClients:tc,totalPistons:tp,totalLevers:tl,bots:bots.size});
+    let tb=0,tbd=0,tc=0,tp=0,tl=0,ts=0;
+    for (const r of rooms.values()) { tb+=r.blocks.size; tbd+=r.rigidBodies.size; tc+=r.clients.size; tp+=r.pistons.size; tl+=r.levers.size; ts+=r.seats.size; }
+    res.json({version:'0.8',uptime:Math.floor(process.uptime()),memoryMB:Math.round(mem.rss/1024/1024),heapMB:Math.round(mem.heapUsed/1024/1024),rooms:rooms.size,totalBlocks:tb,totalBodies:tbd,totalClients:tc,totalPistons:tp,totalLevers:tl,totalSeats:ts,bots:bots.size});
 });
 app.post('/crash', (req,res) => { res.json({ok:true}); setTimeout(()=>process.exit(1),500); });
 app.post('/kickall', (req,res) => {
@@ -293,11 +321,13 @@ const PT = {
     S_BLOCK_SPAWN:20, S_BLOCK_UPDATE:21, S_BLOCK_DELETE:22, S_BLOCK_LIST:23, S_PHYSICS_STATE:24,
     S_PISTON_LIST:30, S_PISTON_SPAWN:31, S_PISTON_UPDATE:32, S_PISTON_DELETE:33, S_PISTON_STATE:34,
     S_LEVER_LIST:40, S_LEVER_SPAWN:41, S_LEVER_DELETE:42, S_LEVER_STATE:43,
+    S_SEAT_LIST:50, S_SEAT_SPAWN:51, S_SEAT_DELETE:52, S_SEAT_STATE:53,
     C_HELLO:100, C_PLAYER_STATE:101, C_CHAT:102, C_PING:103, C_PONG:104,
     C_PLAYER_HEALTH:105, C_PLAYER_DEATH:106, C_REQUEST_RESPAWN:107, C_PLAYER_TOOL:108,
     C_BLOCK_SPAWN:120, C_BLOCK_UPDATE:121, C_BLOCK_DELETE:122,
     C_PISTON_SPAWN:130, C_PISTON_DELETE:131, C_PISTON_TOGGLE:132,
-    C_LEVER_SPAWN:140, C_LEVER_DELETE:141, C_LEVER_TOGGLE:142, C_LEVER_LINK:143, C_LEVER_UNLINK:144
+    C_LEVER_SPAWN:140, C_LEVER_DELETE:141, C_LEVER_TOGGLE:142, C_LEVER_LINK:143, C_LEVER_UNLINK:144,
+    C_SEAT_SPAWN:150, C_SEAT_DELETE:151, C_SEAT_SIT:152, C_SEAT_STAND:153, C_DRIVER_INPUT:154
 };
 
 class Reader {
@@ -324,6 +354,7 @@ class Writer {
     writeBlock(b){this.u32(b.blockId);this.u8(b.shape);this.vec3(b.position);this.quat(b.rotation);this.vec3(b.size);this.vec3(b.color);this.u8(b.anchored);this.u8(b.canCollide);this.f32(b.roughness);this.f32(b.metallic);this.f32(b.transparency);this.u8(b.castShadow);this.str(b.materialName);this.str(b.name);this.u32(b.ownerId);}
     writePiston(p){this.u32(p.pistonId);this.vec3(p.position);this.vec3(p.rotation);this.f32(p.extendDistance);this.f32(p.extendSpeed);this.f32(p.scale);this.vec3(p.color);this.f32(p.currentOffset);this.u8(p.extended?1:0);this.u8(p.isDefault);this.u32(p.ownerId);}
     writeLever(l){this.u32(l.leverId);this.vec3(l.position);this.vec3(l.rotation);this.f32(l.scale);this.u8(l.active?1:0);this.u32(l.linkedPistons.length);for(const pid of l.linkedPistons)this.u32(pid);this.u8(l.isDefault);this.u32(l.ownerId);}
+    writeSeat(s){this.u32(s.seatId);this.vec3(s.position);this.vec3(s.rotation);this.u8(s.isDriver);this.u32(s.occupantId);this.u8(s.isDefault);this.u32(s.ownerId);}
     build(){return Buffer.concat(this.chunks);}
 }
 
@@ -381,6 +412,7 @@ wss.on('connection',(ws,req)=>{
                 const bw=new Writer();bw.u8(PT.S_BLOCK_LIST);bw.u32(room.blocks.size);for(const b of room.blocks.values())bw.writeBlock(b);send(ws,bw.build());
                 const pw2=new Writer();pw2.u8(PT.S_PISTON_LIST);pw2.u32(room.pistons.size);for(const p of room.pistons.values())pw2.writePiston(p);send(ws,pw2.build());
                 const lw=new Writer();lw.u8(PT.S_LEVER_LIST);lw.u32(room.levers.size);for(const l of room.levers.values())lw.writeLever(l);send(ws,lw.build());
+                const sw=new Writer();sw.u8(PT.S_SEAT_LIST);sw.u32(room.seats.size);for(const s of room.seats.values())sw.writeSeat(s);send(ws,sw.build());
 
                 for(const o of others){const hw=new Writer();hw.u8(PT.S_PLAYER_HEALTH);hw.u32(o.playerId);hw.f32(o.health);send(ws,hw.build());}
                 for(const o of others){if(o.holdingTool){const tw=new Writer();tw.u8(PT.S_PLAYER_TOOL);tw.u32(o.playerId);tw.u8(1);send(ws,tw.build());}}
@@ -396,7 +428,7 @@ wss.on('connection',(ws,req)=>{
             if(type===PT.C_CHAT){if(!checkRate(ws.rateLimits,'chat')){const w=new Writer();w.u8(PT.S_CHAT);w.u32(0);w.str("System");w.str("Slow down!");send(ws,w.build());return;}let text=r.str();if(!text)return;if(text.length>200)text=text.substring(0,200);const w=new Writer();w.u8(PT.S_CHAT);w.u32(info.playerId);w.str(info.name);w.str(text);broadcast(room,w.build());return;}
             if(type===PT.C_PING){const seq=r.u32();const w=new Writer();w.u8(PT.S_PONG);w.u32(seq);send(ws,w.build());return;}
             if(type===PT.C_PLAYER_HEALTH){let hp=r.f32();if(!isFinite(hp))return;hp=clamp(hp,0,PLAYER_MAX_HEALTH);if(info.isDead)return;info.health=hp;broadcastPlayerHealth(room,info);return;}
-            if(type===PT.C_PLAYER_DEATH){if(info.isDead)return;info.isDead=true;info.health=0;broadcastPlayerDeath(room,info);setTimeout(()=>{if(!ws.info||!ws.room)return;info.isDead=false;info.health=PLAYER_MAX_HEALTH;broadcastPlayerRespawn(room,info);},RESPAWN_DELAY_MS);return;}
+            if(type===PT.C_PLAYER_DEATH){if(info.isDead)return;info.isDead=true;info.health=0;releaseSeatByPlayer(room,info.playerId);broadcastPlayerDeath(room,info);setTimeout(()=>{if(!ws.info||!ws.room)return;info.isDead=false;info.health=PLAYER_MAX_HEALTH;broadcastPlayerRespawn(room,info);},RESPAWN_DELAY_MS);return;}
             if(type===PT.C_REQUEST_RESPAWN){if(!info.isDead)return;info.isDead=false;info.health=PLAYER_MAX_HEALTH;broadcastPlayerRespawn(room,info);return;}
             if(type===PT.C_PLAYER_TOOL){const holding=r.u8()!==0;info.holdingTool=holding;const w=new Writer();w.u8(PT.S_PLAYER_TOOL);w.u32(info.playerId);w.u8(holding?1:0);broadcast(room,w.build(),ws);return;}
 
@@ -414,17 +446,91 @@ wss.on('connection',(ws,req)=>{
             if(type===PT.C_LEVER_LINK){const lid=r.u32();const pid=r.u32();const l=room.levers.get(lid);const p=room.pistons.get(pid);if(!l||!p)return;if(!l.linkedPistons.includes(pid))l.linkedPistons.push(pid);const w=new Writer();w.u8(PT.S_LEVER_SPAWN);w.writeLever(l);broadcast(room,w.build());return;}
             if(type===PT.C_LEVER_UNLINK){const lid=r.u32();const pid=r.u32();const l=room.levers.get(lid);if(!l)return;l.linkedPistons=l.linkedPistons.filter(id=>id!==pid);const w=new Writer();w.u8(PT.S_LEVER_SPAWN);w.writeLever(l);broadcast(room,w.build());return;}
 
+            // ═══ SEATS ═══
+            if(type===PT.C_SEAT_SPAWN){
+                if(room.seats.size>=MAX_SEATS_PER_ROOM)return;
+                const pos=r.vec3();
+                const isDriver=r.u8();
+                if(!isValidVec3(pos))return;
+                const seat=createSeatData(room,pos,isDriver,false);
+                seat.ownerId=info.playerId;
+                room.seats.set(seat.seatId,seat);
+                const w=new Writer();
+                w.u8(PT.S_SEAT_SPAWN);
+                w.writeSeat(seat);
+                broadcast(room,w.build());
+                return;
+            }
+            if(type===PT.C_SEAT_DELETE){
+                const sid=r.u32();
+                const seat=room.seats.get(sid);
+                if(!seat||seat.isDefault)return;
+                // Освобождаем сиденье если кто-то сидит
+                if(seat.occupantId!==0){
+                    const ws2=new Writer();
+                    ws2.u8(PT.S_SEAT_STATE);ws2.u32(seat.seatId);ws2.u32(0);
+                    broadcast(room,ws2.build());
+                }
+                room.seats.delete(sid);
+                const w=new Writer();
+                w.u8(PT.S_SEAT_DELETE);w.u32(sid);
+                broadcast(room,w.build());
+                return;
+            }
+            if(type===PT.C_SEAT_SIT){
+                const sid=r.u32();
+                const seat=room.seats.get(sid);
+                if(!seat)return;
+                if(seat.occupantId!==0)return; // занято
+                // Освободить предыдущее сиденье этого игрока если есть
+                releaseSeatByPlayer(room,info.playerId);
+                seat.occupantId=info.playerId;
+                const w=new Writer();
+                w.u8(PT.S_SEAT_STATE);
+                w.u32(seat.seatId);w.u32(info.playerId);
+                broadcast(room,w.build());
+                return;
+            }
+            if(type===PT.C_SEAT_STAND){
+                const sid=r.u32();
+                const seat=room.seats.get(sid);
+                if(!seat)return;
+                if(seat.occupantId!==info.playerId)return;
+                seat.occupantId=0;
+                seat.throttle=0;seat.steer=0;
+                const w=new Writer();
+                w.u8(PT.S_SEAT_STATE);
+                w.u32(seat.seatId);w.u32(0);
+                broadcast(room,w.build());
+                return;
+            }
+            if(type===PT.C_DRIVER_INPUT){
+                const sid=r.u32();
+                const throttle=r.f32();
+                const steer=r.f32();
+                const seat=room.seats.get(sid);
+                if(!seat||seat.occupantId!==info.playerId)return;
+                if(!seat.isDriver)return;
+                seat.throttle=clamp(throttle,-1,1);
+                seat.steer=clamp(steer,-1,1);
+                // Пока не транслируем — Engine классы обработают на клиенте локально
+                return;
+            }
+
         }catch(e){log.error('WS msg error:',e.message);}
     });
 
     ws.on('close',()=>{
         const room=ws.room,info=ws.info;ws.room=null;ws.info=null;
-        if(!room||!info)return;room.clients.delete(ws);
+        if(!room||!info)return;
+        // Освобождаем все сиденья этого игрока
+        releaseSeatByPlayer(room,info.playerId);
+        room.clients.delete(ws);
         const w=new Writer();w.u8(PT.S_PLAYER_LEAVE);w.u32(info.playerId);broadcast(room,w.build());
         log.info(`Player left: ${info.name} (id=${info.playerId})`);
         let rc=0;for(const[wsx]of room.clients)if(!wsx.isBot)rc++;
         if(rc===0&&rooms.size>1){
-            try{for(const body of room.rigidBodies.values()){try{room.world.removeRigidBody(body);}catch(e){}}for(const p of room.pistons.values())removePistonBodies(room,p);room.rigidBodies.clear();room.pistons.clear();room.levers.clear();if(room.world){room.world.free();room.world=null;}}catch(e){log.error('Cleanup:',e.message);}
+            try{for(const body of room.rigidBodies.values()){try{room.world.removeRigidBody(body);}catch(e){}}for(const p of room.pistons.values())removePistonBodies(room,p);room.rigidBodies.clear();room.pistons.clear();room.levers.clear();room.seats.clear();if(room.world){room.world.free();room.world=null;}}catch(e){log.error('Cleanup:',e.message);}
             for(const[id,b]of Array.from(bots.entries()))if(b.room===room)removeBot(id);
             rooms.delete(room.id);log.info(`Removed empty room ${room.id}`);
         }
